@@ -1,0 +1,16 @@
+{
+  "name": "sekretka",
+  "version": "1.0.0",
+  "description": "Секретка — шифрованный мессенджер в браузере. E2E: X25519 + AES-GCM (WebCrypto). Сервер хранит только шифротекст.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "demo": "set DEMO=1&& node server.js",
+    "test:crypto": "node test/crypto.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

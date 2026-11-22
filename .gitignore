@@ -1,0 +1,19 @@
+node_modules/
+data.json
+data.json.tmp
+shots/
+
+# медиа-хранилище (шифротекст переписки)
+media/
+
+# локальные туннели и бинарники (55 МБ — в git не нужны)
+tools/cloudflared.exe
+tools/*.exe
+cf.log
+cf.err.log
+tunnel-current.log
+
+# локальные логи и временные файлы
+*.log
+tmp-*
+tools/*.zip

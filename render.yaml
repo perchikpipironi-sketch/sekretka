@@ -1,0 +1,38 @@
+# Render Blueprint — Секретка
+# Как применить: залей репозиторий на GitHub, затем в Render → New → Blueprint,
+# выбери репозиторий. Render сам прочитает этот файл.
+#
+# ВАЖНО (честно):
+#  * На бесплатном плане Render НЕ поддерживает постоянные диски (disk:).
+#    Поэтому data.json и папка media у бесплатного сервиса живут в эфемерной ФС:
+#    после каждого деплоя/перезапуска сервиса история и аккаунты обнуляются.
+#  * Бесплатный web-сервис «засыпает» после ~15 минут без запросов и просыпается
+#    30–60 секунд при следующем заходе. Первое открытие будет долгим — это нормально.
+#  * WebSocket-соединения Render поддерживает, но во время сна сервиса связи нет.
+services:
+  - type: web
+    name: sekretka
+    runtime: node
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: HOST
+        value: 0.0.0.0
+      # Render сам подставляет PORT — server.js его читает.
+      # Если позже появится платный план с диском, раскомментируй:
+      # - key: DATA_FILE
+      #   value: /var/data/data.json
+      # - key: MEDIA_DIR
+      #   value: /var/data/media
+# Платный вариант с постоянным диском (free-план это проигнорирует):
+#    disk:
+#      name: sekretka-data
+#      mountPath: /var/data
+#      sizeGB: 1

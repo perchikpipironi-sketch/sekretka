@@ -1,0 +1,365 @@
+'use strict';
+/**
+ * Секретка — сервер.
+ * Не знает открытых текстов: сообщения приходят и хранятся только как шифротекст.
+ * Зависимость одна: ws (WebSocket). Всё остальное — встроенные модули Node.
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const os = require('os');
+const { WebSocketServer } = require('ws');
+const Store = require('./lib/store');
+
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const ROOT = path.join(__dirname, 'public');
+const store = new Store(DATA_FILE);
+
+// ---------- медиа (файлы): храним только шифротекст, как и сообщения ----------
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(__dirname, 'media');
+const MEDIA_IDX = path.join(MEDIA_DIR, 'index.json');
+let mediaIdx = {};
+try { if (fs.existsSync(MEDIA_IDX)) mediaIdx = JSON.parse(fs.readFileSync(MEDIA_IDX, 'utf8')); } catch (e) { mediaIdx = {}; }
+function saveMediaIdx() {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  const tmp = MEDIA_IDX + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(mediaIdx));
+  fs.renameSync(tmp, MEDIA_IDX);
+}
+function mediaId() { return Date.now().toString(36) + '-' + crypto.randomBytes(6).toString('hex'); }
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon'
+};
+
+// ---------- криптопримитивы сервера (только для аутентификации) ----------
+function hashToken(tok) { return crypto.createHash('sha256').update(String(tok)).digest('hex'); }
+function scryptHash(pass, salt) { return crypto.scryptSync(String(pass), salt, 64).toString('hex'); }
+function issueToken(nick) {
+  const tok = crypto.randomBytes(32).toString('hex');
+  store.addToken(hashToken(tok), nick);
+  return tok;
+}
+function verifyPass(user, pass) {
+  const h = scryptHash(pass, user.salt);
+  const a = Buffer.from(h, 'hex'), b = Buffer.from(user.hash, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// ---------- демо-сид (DEMO=1) ----------
+function seedDemo() {
+  for (const n of ['demo_alice', 'demo_bob']) {
+    if (!store.getUser(n)) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      store.createUser(n, scryptHash('demo', salt), salt);
+    }
+  }
+}
+if (process.env.DEMO === '1') seedDemo();
+
+// ---------- онлайн-присутствие ----------
+// nick(нижний регистр) -> Set<ws>: у одного аккаунта может быть несколько вкладок/устройств,
+// и КАЖДАЯ из них должна получать события (push в одну «последнюю» ломал живые обновления).
+const online = new Map();
+
+function onlineAdd(nick, ws) {
+  const k = String(nick).toLowerCase();
+  if (!online.has(k)) online.set(k, new Set());
+  online.get(k).add(ws);
+}
+function onlineRemove(nick, ws) {
+  const k = String(nick).toLowerCase();
+  const set = online.get(k);
+  if (!set) return;
+  set.delete(ws);
+  if (!set.size) online.delete(k);
+}
+function onlineCount(nick) {
+  const set = online.get(String(nick).toLowerCase());
+  return set ? set.size : 0;
+}
+function sendTo(nick, obj) {
+  const set = online.get(String(nick).toLowerCase());
+  if (!set || !set.size) return 0;
+  const data = JSON.stringify(obj);
+  let sent = 0;
+  for (const ws of set) {
+    if (ws.readyState === 1) {
+      try { ws.send(data); sent++; } catch (e) { /* сокет уже мёртв */ }
+    }
+  }
+  return sent;
+}
+
+// ---------- HTTP ----------
+function sendJSON(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function readBody(req, limitMB) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const limit = (limitMB || 2) * 1024 * 1024;
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) { reject(new Error('body_too_large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
+      catch (e) { reject(new Error('bad_json')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function parseToken(req) {
+  const h = req.headers.authorization || '';
+  const m = /^Bearer\s+([A-Za-z0-9]+)$/.exec(h);
+  return m ? store.userByToken(hashToken(m[1])) : null;
+}
+
+const NICK_RE = /^[\p{L}\p{N}_]{2,20}$/u;
+function validNick(n) { return typeof n === 'string' && NICK_RE.test(n); }
+function validPass(p) { return typeof p === 'string' && p.length >= 4 && p.length <= 72; }
+function validPub(p) { return typeof p === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(p) && p.length >= 40 && p.length <= 120; }
+
+// ---------- API ----------
+async function handleApi(req, res, pathname) {
+  const method = req.method;
+  const u = new URL(pathname, 'http://x');
+
+  if (method === 'GET' && u.pathname === '/api/health') return sendJSON(res, 200, { ok: true });
+
+  if (method === 'POST' && u.pathname === '/api/register') {
+    const body = await readBody(req);
+    const nick = String(body.nick || '').trim();
+    if (!validNick(nick)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов, буквы/цифры/подчёркивание' });
+    if (!validPass(body.pass)) return sendJSON(res, 400, { error: 'Пароль: 4–72 символа' });
+    if (store.getUser(nick)) return sendJSON(res, 409, { error: 'Такое имя уже занято' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    store.createUser(nick, scryptHash(body.pass, salt), salt);
+    return sendJSON(res, 200, { token: issueToken(nick), nick: store.getUser(nick).name });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/login') {
+    const body = await readBody(req);
+    const nick = String(body.nick || '').trim();
+    const user = store.getUser(nick);
+    if (!user || !verifyPass(user, body.pass)) return sendJSON(res, 401, { error: 'Неверное имя или пароль' });
+    return sendJSON(res, 200, { token: issueToken(nick), nick: user.name });
+  }
+
+  const user = parseToken(req);
+  if (!user) return sendJSON(res, 401, { error: 'Требуется вход' });
+  const me = user.name;
+
+  if (method === 'PUT' && u.pathname === '/api/me') {
+    const body = await readBody(req);
+    if (!validPub(body.pub)) return sendJSON(res, 400, { error: 'Неверный публичный ключ' });
+    store.setPub(me, body.pub);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'GET' && u.pathname === '/api/friends') {
+    return sendJSON(res, 200, { friends: store.friendsOf(me).map(f => ({ ...f, online: onlineCount(f.nick) > 0 })) });
+  }
+
+  if (method === 'GET' && u.pathname === '/api/friend/requests') {
+    return sendJSON(res, 200, {
+      incoming: store.incomingRequests(me),
+      outgoing: store.outgoingRequests(me)
+    });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/friend/request') {
+    const body = await readBody(req);
+    const nick = String(body.nick || '').trim();
+    if (!validNick(nick)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов' });
+    if (nick.toLowerCase() === me.toLowerCase()) return sendJSON(res, 400, { error: 'Нельзя добавить себя' });
+    if (!store.getUser(nick)) return sendJSON(res, 404, { error: 'Пользователь не найден' });
+    const st = store.requestFriend(me, nick);
+    if (st === 'already') return sendJSON(res, 400, { error: 'Вы уже друзья' });
+    if (st === 'pending') return sendJSON(res, 400, { error: 'Заявка уже отправлена' });
+    // мгновенно сообщаем адресату, если он онлайн (во все его вкладки/устройства)
+    sendTo(nick, { type: 'request', from: me });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/friend/accept') {
+    const body = await readBody(req);
+    const nick = String(body.nick || '').trim();
+    if (!store.acceptFriend(me, nick)) return sendJSON(res, 400, { error: 'Нет такой заявки или нет ключей' });
+    const f = store.friendsOf(me).find(x => x.nick.toLowerCase() === nick.toLowerCase());
+    // мгновенно сообщаем автору заявки, что его приняли
+    sendTo(nick, { type: 'friend-accepted', by: me });
+    return sendJSON(res, 200, { ok: true, pub: f ? f.pub : null });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/friend/decline') {
+    const body = await readBody(req);
+    store.declineFriend(me, String(body.nick || '').trim());
+    sendTo(String(body.nick || '').trim(), { type: 'friend-declined', by: me });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/friend/remove') {
+    const body = await readBody(req);
+    store.removeFriend(me, String(body.nick || '').trim());
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/media') {
+    const body = await readBody(req, 26);
+    const to = String(body.to || '').trim();
+    if (!validNick(to)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов' });
+    if (store.friendStatus(me, to) !== 'accepted') return sendJSON(res, 403, { error: 'Нет доступа: вы не друзья' });
+    if (typeof body.b64 !== 'string' || !body.b64) return sendJSON(res, 400, { error: 'Нет данных файла' });
+    const buf = Buffer.from(body.b64, 'base64');
+    if (!buf.length) return sendJSON(res, 400, { error: 'Пустой файл' });
+    if (buf.length > 24 * 1024 * 1024) return sendJSON(res, 413, { error: 'Файл больше 24 МБ' });
+    const name = String(body.name || 'file').slice(0, 120);
+    const mime = String(body.mime || 'application/octet-stream').slice(0, 100);
+    const id = mediaId();
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(MEDIA_DIR, id), buf);
+    mediaIdx[id] = { owner: me, size: buf.length, name: mime };
+    saveMediaIdx();
+    return sendJSON(res, 200, { id, size: buf.length });
+  }
+
+  const mediaM = /^\/api\/media\/([A-Za-z0-9-]+)$/.exec(u.pathname);
+  if (method === 'GET' && mediaM) {
+    const id = mediaM[1];
+    const meta = mediaIdx[id];
+    if (!meta) return sendJSON(res, 404, { error: 'Файл не найден' });
+    if (meta.owner !== me && store.friendStatus(me, meta.owner) !== 'accepted')
+      return sendJSON(res, 403, { error: 'Нет доступа' });
+    const p = path.join(MEDIA_DIR, id);
+    if (!fs.existsSync(p)) return sendJSON(res, 404, { error: 'Файл не найден' });
+    const buf = fs.readFileSync(p);
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length });
+    res.end(buf);
+    return;
+  }
+
+  if (method === 'POST' && u.pathname === '/api/msg') {
+    const body = await readBody(req);
+    const to = String(body.to || '').trim();
+    if (!validNick(to)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов' });
+    if (store.friendStatus(me, to) !== 'accepted') return sendJSON(res, 403, { error: 'Нет доступа: вы не друзья' });
+    if (typeof body.body !== 'string' || !body.body || body.body.length > 40000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.body))
+      return sendJSON(res, 400, { error: 'Неверный шифротекст' });
+    const rec = store.addMsg(me, to, body.body);
+    sendTo(to, { type: 'msg', from: store.getUser(me).name, to, id: rec.id, ts: rec.ts, body: rec.body });
+    return sendJSON(res, 200, { id: rec.id, ts: rec.ts });
+  }
+
+  const convM = /^\/api\/conv\/([A-Za-z0-9_%]+)$/.exec(u.pathname);
+  if (method === 'GET' && convM) {
+    const nick = decodeURIComponent(convM[1]);
+    if (store.friendStatus(me, nick) !== 'accepted') return sendJSON(res, 403, { error: 'Нет доступа' });
+    const after = u.searchParams.get('after') ? parseInt(u.searchParams.get('after'), 10) : 0;
+    const msgs = store.getMsgs(me, nick, after || 0);
+    store.markSeen(me, nick);
+    return sendJSON(res, 200, { msgs });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/seen') {
+    const body = await readBody(req);
+    store.markSeen(me, String(body.nick || '').trim());
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  return sendJSON(res, 404, { error: 'Не найдено' });
+}
+
+// ---------- статика ----------
+function serveStatic(req, res, pathname) {
+  let p = pathname === '/' ? '/index.html' : pathname;
+  p = path.normalize(path.join(ROOT, p));
+  if (!p.startsWith(ROOT)) return sendJSON(res, 403, { error: 'Forbidden' });
+  fs.readFile(p, (err, buf) => {
+    if (err) return sendJSON(res, 404, { error: 'Not found' });
+    const ext = path.extname(p).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': buf.length });
+    res.end(buf);
+  });
+}
+
+// ---------- WebSocket ----------
+const wss = new WebSocketServer({ noServer: true });
+
+function broadcastPresence(nick, value) {
+  const friends = store.friendsOf(nick);
+  const msg = { type: 'presence', nick: store.getUser(nick).name, online: value };
+  for (const f of friends) sendTo(f.nick, msg);
+}
+
+wss.on('connection', (ws, req) => {
+  const u = new URL(req.url, 'http://x');
+  const user = store.userByToken(hashToken(u.searchParams.get('token') || ''));
+  if (!user) { ws.close(4001, 'unauthorized'); return; }
+  const nick = user.name;
+  const wasOnline = onlineCount(nick) > 0;
+  onlineAdd(nick, ws);
+  ws.send(JSON.stringify({ type: 'hello', me: nick }));
+  if (!wasOnline) broadcastPresence(nick, true);
+
+  ws.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'typing' && msg.to) {
+        sendTo(msg.to, { type: 'typing', nick });
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  ws.on('close', () => {
+    onlineRemove(nick, ws);
+    if (onlineCount(nick) === 0) broadcastPresence(nick, false);
+  });
+});
+
+const server = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname.startsWith('/api/')) {
+    handleApi(req, res, u.pathname).catch(err => {
+      const code = err.message === 'bad_json' ? 400 : err.message === 'body_too_large' ? 413 : 500;
+      sendJSON(res, code, { error: err.message === 'bad_json' ? 'Неверный JSON' : err.message === 'body_too_large' ? 'Слишком большой запрос' : 'Внутренняя ошибка' });
+    });
+  } else {
+    serveStatic(req, res, u.pathname);
+  }
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname !== '/ws') { socket.destroy(); return; }
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+});
+
+server.listen(PORT, HOST, () => {
+  const nets = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(nets)) {
+    for (const ni of nets[name] || []) {
+      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
+    }
+  }
+  console.log('Секретка запущена:');
+  console.log('  Локально:   http://127.0.0.1:' + PORT);
+  for (const ip of ips) console.log('  В сети LAN: http://' + ip + ':' + PORT);
+  console.log('  Хранилище: ' + DATA_FILE);
+});

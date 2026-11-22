@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>Секретка — шифрованный мессенджер</title>
+  <meta name="description" content="Мессенджер со сквозным шифрованием прямо в браузере: X25519 + AES-GCM. Сервер не видит тексты сообщений."/>
+  <meta name="theme-color" content="#04121b"/>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml"/>
+  <script>(function(){try{var t=localStorage.getItem('sk_theme')||'neon';if(t==='dark')t='crimson';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <link rel="stylesheet" href="/styles.css?v=20"/>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toasts"></div>
+  <input type="file" id="fileInput" hidden accept="image/*,video/*,audio/*,application/*,text/*,*"/>
+
+  <script src="/vendor/nacl.min.js"></script>
+  <script src="/js/crypto.js?v=20"></script>
+  <script src="/app.js?v=20"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+const q = s => document.querySelector(s);
+const rect = el => { if (!el) return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
+const rail = q('.rail'), side = q('.side'), chat = q('.chat'), right = q('.right-panel');
+const body = q('#chatBody');
+return {
+  viewport: [innerWidth, innerHeight],
+  rail: rect(rail), side: rect(side), chat: rect(chat), right: rect(right),
+  railButtons: [...document.querySelectorAll('.rail-btn')].map(b => ({ id: b.id, label: (b.querySelector('.rl') || {}).textContent || '', w: Math.round(b.getBoundingClientRect().width) })),
+  railBadge: (q('#requestsBadge') || {}).textContent || '',
+  sideTitle: (q('.mini-brand') || {}).textContent || '',
+  friendItems: document.querySelectorAll('.friend-item').length,
+  activeFriend: (q('.friend-item.on .friend-name') || {}).textContent || '',
+  chatTitle: (q('#chatTitle') || {}).textContent || '',
+  msgCount: document.querySelectorAll('.msg').length,
+  mine: document.querySelectorAll('.msg-row.mine').length,
+  theirs: document.querySelectorAll('.msg-row.theirs').length,
+  grouped: document.querySelectorAll('.msg-row.grouped').length,
+  avatarsInRows: document.querySelectorAll('.msg-row .avatar').length,
+  tsNodes: document.querySelectorAll('.msg .ts').length,
+  daySeps: [...document.querySelectorAll('.day-sep')].map(e => e.textContent),
+  composer: rect(q('.chat-input')),
+  attachBtns: document.querySelectorAll('.chat-input .attach-btn').length,
+  composerChildren: [...document.querySelectorAll('.chat-input > *')].map(e => e.id || e.className),
+  recBtnMode: (q('#recBtn') || {}).dataset ? q('#recBtn').dataset.mode : null,
+  voiceCards: document.querySelectorAll('.file-card.voice').length,
+  voiceBars: q('.file-card.voice .voice-bars') ? q('.file-card.voice .voice-bars').children.length : 0,
+  voiceDur: (q('.file-card.voice .voice-dur') || {}).textContent || null,
+  voiceAudio: document.querySelectorAll('.file-card.voice audio').length,
+  circleCards: document.querySelectorAll('.file-card.circle').length,
+  jumpDownShown: !!(q('#jumpDown') && q('#jumpDown').classList.contains('show')),
+  bodyBgAttachment: getComputedStyle(document.body).backgroundAttachment,
+  bodyBgRepeat: getComputedStyle(document.body).backgroundRepeat,
+  chatBody: body ? { top: Math.round(body.scrollTop), h: body.scrollHeight, client: body.clientHeight, atBottom: body.scrollHeight - body.scrollTop - body.clientHeight < 120 } : null,
+  docScrollWidth: document.documentElement.scrollWidth,
+  overflowX: document.documentElement.scrollWidth > innerWidth + 1,
+  widerThanViewport: [...document.querySelectorAll('main, .main, .side, .chat, .right-panel, .chat-body, .chat-input')].filter(e => e.getBoundingClientRect().width > innerWidth + 2).map(e => e.className),
+  drawerOpen: document.documentElement.classList.contains('drawer-open'),
+  rightOpen: document.documentElement.classList.contains('right-open'),
+  theme: document.documentElement.getAttribute('data-theme'),
+  version: [...document.querySelectorAll('.rail-ver')].map(e => e.textContent)
+};
