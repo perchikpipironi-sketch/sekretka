@@ -194,9 +194,9 @@ function validVault(v) { return typeof v === 'string' && /^[A-Za-z0-9+/]+={0,2}$
 function normNick(n) { return String(n || '').trim().toLowerCase(); }
 
 // ---------- API ----------
-async function handleApi(req, res, pathname) {
+async function handleApi(req, res) {
   const method = req.method;
-  const u = new URL(pathname, 'http://x');
+  const u = new URL(req.url, 'http://x');
 
   if (method === 'GET' && u.pathname === '/api/health') return sendJSON(res, 200, { ok: true });
 
@@ -342,9 +342,33 @@ async function handleApi(req, res, pathname) {
     if (typeof body.body !== 'string' || !body.body || body.body.length > 40000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.body))
       return sendJSON(res, 400, { error: 'Неверный шифротекст' });
     store.syncFriendKeys(me, to); // держим pub собеседника свежим — иначе после смены ключа диалог «немеет»
-    const rec = store.addMsg(me, to, body.body);
-    sendTo(to, { type: 'msg', from: store.getUser(me).name, to, id: rec.id, ts: rec.ts, body: rec.body });
-    return sendJSON(res, 200, { id: rec.id, ts: rec.ts });
+    const burn = !!body.burn;
+    const rec = store.addMsg(me, to, body.body, burn);
+    sendTo(to, { type: 'msg', from: store.getUser(me).name, to, id: rec.id, ts: rec.ts, body: rec.body, burn });
+    return sendJSON(res, 200, { id: rec.id, ts: rec.ts, burn });
+  }
+
+  // удалить переписку с другом (обе стороны)
+  if (method === 'DELETE' && u.pathname === '/api/conv') {
+    const nick = String(u.searchParams.get('nick') || '').trim();
+    if (!validNick(nick)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов' });
+    store.deleteConv(me, nick);
+    sendTo(nick, { type: 'conv-deleted', nick: store.getUser(me).name });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // удалить своё сообщение
+  const msgDelM = /^\/api\/msg\/(\d+)$/.exec(u.pathname);
+  if (method === 'DELETE' && msgDelM) {
+    const to = String(u.searchParams.get('conv') || '').trim();
+    if (!validNick(to)) return sendJSON(res, 400, { error: 'Имя: 2–20 символов' });
+    const id = msgDelM[1];
+    const rec = store.deleteMsg(me, to, id);
+    if (!rec) return sendJSON(res, 404, { error: 'Сообщение не найдено или не твоё' });
+    const nick = store.getUser(me).name;
+    sendTo(to, { type: 'msg-deleted', nick, id: rec.id });
+    sendTo(me, { type: 'msg-deleted', nick: to, id: rec.id });
+    return sendJSON(res, 200, { ok: true });
   }
 
   const convM = /^\/api\/conv\/([A-Za-z0-9_%]+)$/.exec(u.pathname);
@@ -520,6 +544,11 @@ wss.on('connection', (ws, req) => {
         // ретрансляция WebRTC-сигнала конкретному sid (соединению) в звонке
         const to = String(msg.to || '');
         if (to) voiceSendSid(to, { type: 'voice-signal', from: ws._voiceSid, signal: msg.signal });
+      } else if (msg.type === 'voice-screen') {
+        // статус демонстрации экрана: комната узнаёт, у кого включена демка
+        const key = ws._voiceKey;
+        if (!key) return;
+        voiceBroadcast(key, ws._voiceSid, { type: 'voice-screen', from: ws._voiceSid, on: !!msg.on });
       } else if (msg.type === 'voice') {
         const g = store.getGuild(String(msg.guildId || ''));
         if (!g) return;
@@ -575,7 +604,7 @@ wss.on('connection', (ws, req) => {
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
   if (u.pathname.startsWith('/api/')) {
-    handleApi(req, res, u.pathname).catch(err => {
+    handleApi(req, res).catch(err => {
       const code = err.message === 'bad_json' ? 400 : err.message === 'body_too_large' ? 413 : 500;
       sendJSON(res, code, { error: err.message === 'bad_json' ? 'Неверный JSON' : err.message === 'body_too_large' ? 'Слишком большой запрос' : 'Внутренняя ошибка' });
     });

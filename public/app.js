@@ -2,7 +2,7 @@
 /* Секретка — клиент. Вся криптография — здесь, в браузере. */
 
 const LS = { nick: 'sk_nick', token: 'sk_token', kp: 'sk_kp', theme: 'sk_theme' };
-const APP_VERSION = '26';
+const APP_VERSION = '40';
 
 const state = {
   me: null, token: null, kp: null,
@@ -11,7 +11,8 @@ const state = {
   msgs: [], unread: {}, typing: {}, typingTimers: {},
   lastTs: 0,
   guilds: [], gview: null, view: 'dm',
-  ws: null, wsTry: 0, dec: 0
+  ws: null, wsTry: 0, dec: 0,
+  burn: false // сгорающие сообщения (переключается кнопкой в композере)
 };
 
 const $ = (sel, root) => (root || document).querySelector(sel);
@@ -199,7 +200,7 @@ async function resolveKeyForAccount(pass) {
 // если в аккаунте уже лежит другой pub (ключ сменили на другом устройстве) — отдаём false.
 // Заодно запоминаем, есть ли в аккаунте конверт ключа (нужно initMain, чтобы предложить бэкап).
 let lastHasVault = false;
-async function syncPub() {
+async function syncPub(force) {
   const localPub = window.SecCrypto.publicB64(state.kp);
   let serverPub = null;
   lastHasVault = false;
@@ -208,7 +209,7 @@ async function syncPub() {
     serverPub = me.pub;
     lastHasVault = !!me.hasVault;
   } catch (e) { /* не критично */ }
-  if (!serverPub) {
+  if (force || !serverPub) {
     try { await api('PUT', '/api/me', { pub: localPub }); } catch (e) { /* не критично */ }
     return true;
   }
@@ -336,7 +337,8 @@ function renderAuth() {
 // ---------- модальные окна ----------
 let escFn = null;
 function closeModal() {
-  const o = $('.overlay');
+  const ols = document.querySelectorAll('.overlay');
+  const o = ols[ols.length - 1];
   if (o) o.remove();
   if (escFn) { document.removeEventListener('keydown', escFn); escFn = null; }
 }
@@ -359,6 +361,24 @@ function fallbackCopy(text, done) {
   ta.remove();
 }
 
+// Модалка-подтверждение поверх текущей (закрывает только её, нижняя остаётся).
+function askConfirm(title, text) {
+  return new Promise(resolve => {
+    const modal = h('div', { class: 'modal' });
+    modal.append(
+      h('h3', {}, title),
+      h('p', {}, text),
+      h('div', { class: 'modal-actions' },
+        h('button', { class: 'btn-primary', id: 'askYes', type: 'button' }, 'Да'),
+        h('button', { class: 'btn-ghost', id: 'askNo', type: 'button' }, 'Отмена')
+      )
+    );
+    attachOverlay(modal);
+    modal.querySelector('#askYes').addEventListener('click', () => { closeModal(); resolve(true); });
+    modal.querySelector('#askNo').addEventListener('click', () => { closeModal(); resolve(false); });
+  });
+}
+
 function showKeyModal(kind, opts) {
   opts = opts || {};
   const modal = h('div', { class: 'modal' });
@@ -372,8 +392,7 @@ function showKeyModal(kind, opts) {
         h('button', { class: 'btn-primary', id: 'copyKey', type: 'button' }, '📋 Скопировать'),
         h('button', { class: 'btn-ghost', id: 'backupDone', type: 'button' }, 'Я сохранил(а)')
       ),
-      h('button', { class: 'btn-link', id: 'keyRestoreLink', type: 'button' }, 'Вставить отмычку с другого устройства'),
-      h('button', { class: 'btn-link', id: 'backupSkip', type: 'button' }, 'Пропустить — войти без бэкапа')
+      h('button', { class: 'btn-link', id: 'changeKeyLink', type: 'button' }, 'Сменить ключ (для новых сообщений)')
     );
     modal.querySelector('#copyKey').addEventListener('click', () => {
       const done = () => toast('Ключ скопирован 📋');
@@ -382,44 +401,59 @@ function showKeyModal(kind, opts) {
       } else fallbackCopy(secret, done);
     });
     modal.querySelector('#backupDone').addEventListener('click', () => { closeModal(); initMain(); });
-    modal.querySelector('#backupSkip').addEventListener('click', () => { closeModal(); initMain(); });
-    modal.querySelector('#keyRestoreLink').addEventListener('click', () => { closeModal(); showKeyModal('enter', { reason: 'manual', pass: state.pass }); });
+    modal.querySelector('#changeKeyLink').addEventListener('click', async () => {
+      const ok = await askConfirm(
+        'Сменить ключ?',
+        'Будет создан новый ключ: новые сообщения пойдут с ним, а старая переписка останется доступной только со старым ключом (отмычкой).'
+      );
+      if (!ok) return;
+      state.kp = makeKp();
+      saveKp(state.kp);
+      if (state.pass) await vaultSave(state.pass);
+      await syncPub(true);
+      closeModal(); showKeyModal('new');
+      toast('Новый ключ создан и сохранён 🔑');
+    });
   } else if (kind === 'enter') {
     const reason = opts.reason || 'missing';
     const intro = reason === 'conflict'
-      ? 'На этом устройстве лежит ключ от другого аккаунта. Вставь отмычку от этого аккаунта — или создай новый ключ (тогда старая переписка станет недоступной):'
-      : 'На этом устройстве ещё нет ключа от этого аккаунта, и в самом аккаунте он не сохранён. Возьми отмычку на старом устройстве (кнопка «Ключ» слева) и вставь сюда — или создай новый ключ (старая переписка станет недоступной):';
+      ? 'Ключ на этом устройстве не совпадает с ключом аккаунта. Вставь правильную отмычку — либо войди без бэкапа: будет создан новый ключ, и старая переписка с этого устройства станет недоступной.'
+      : 'На этом устройстве ещё нет ключа от этого аккаунта. Возьми отмычку на старом устройстве (кнопка «Ключ» слева) и вставь сюда — либо войди без бэкапа: переписка будет видна только на этом устройстве.';
     modal.append(
       h('h3', {}, 'Ключ от этого аккаунта'),
       h('p', {}, intro),
       h('textarea', { id: 'restoreBox', placeholder: 'Вставь секретный ключ (base64)…' }),
       h('div', { class: 'modal-actions' },
         h('button', { class: 'btn-primary', id: 'restoreGo', type: 'button' }, 'Восстановить'),
-        h('button', { class: 'btn-ghost', id: 'restoreNew', type: 'button' }, 'Создать новый')
-      ),
-      opts.pass ? h('button', { class: 'btn-link', id: 'restoreRetry', type: 'button' }, 'Попробовать снова с паролем') : null
+        h('button', { class: 'btn-ghost', id: 'restoreSkip', type: 'button' }, 'Войти без бэкапа')
+      )
     );
+    const adoptKey = async (kp, fromSkip) => {
+      saveKp(kp); state.kp = kp;
+      if (state.pass) await vaultSave(state.pass, kp);
+      let serverPub = null;
+      try { serverPub = (await api('GET', '/api/me')).pub; } catch (e) { /* не критично */ }
+      if (serverPub && serverPub !== window.SecCrypto.publicB64(kp)) {
+        const ok = await askConfirm(
+          fromSkip ? 'Войти без бэкапа?' : 'Ключ в аккаунте другой',
+          fromSkip
+            ? 'Ключ аккаунта будет заменён на новый: переписка откроется только на этом устройстве, а на прежних устройствах она не появится.'
+            : 'Этот ключ не совпадает с ключом аккаунта. Заменить ключ аккаунта на этот? Переписка, зашифрованная старым ключом, станет недоступной.'
+        );
+        if (!ok) return;
+        await syncPub(true);
+      }
+      closeModal(); initMain();
+    };
     modal.querySelector('#restoreGo').addEventListener('click', async () => {
-      try {
-        const kp = window.SecCrypto.keypairFromSecret($('#restoreBox').value.trim());
-        saveKp(kp); state.kp = kp;
-        if (state.pass) vaultSave(state.pass, kp);
-        closeModal(); initMain();
-      } catch (e) { toast('Не похоже на ключ 🤔', 'err'); }
+      let kp;
+      try { kp = window.SecCrypto.keypairFromSecret($('#restoreBox').value.replace(/\s+/g, '')); }
+      catch (e) { toast('Не похоже на ключ 🤔', 'err'); return; }
+      await adoptKey(kp, false);
     });
-    modal.querySelector('#restoreNew').addEventListener('click', async () => {
-      if (!window.confirm('Создать новый ключ? Переписка, зашифрованная старым ключом, останется недоступной.')) return;
-      state.kp = makeKp();
-      if (state.pass) await vaultSave(state.pass);
-      closeModal(); showKeyModal('new');
+    modal.querySelector('#restoreSkip').addEventListener('click', async () => {
+      await adoptKey(makeKp(), true);
     });
-    if (opts.pass) {
-      modal.querySelector('#restoreRetry').addEventListener('click', async () => {
-        const kp = await vaultRestore(opts.pass);
-        if (kp) { saveKp(kp); state.kp = kp; closeModal(); initMain(); toast('Ключ подтянут из аккаунта 🔑'); }
-        else toast('В аккаунте нет сохранённого ключа', 'err');
-      });
-    }
   }
   attachOverlay(modal);
 }
@@ -562,7 +596,7 @@ function renderMain() {
     h('div', { class: 'typing-hint', id: 'typingHint' }),
     h('button', { class: 'jump-down', id: 'jumpDown', type: 'button', title: 'Вниз' }, '⬇'),
     h('div', { class: 'chat-input no-text', id: 'chatInput' },
-      h('div', { class: 'composer-logo', title: 'Секретка — шифрованный мессенджер' }, '◈'),
+      h('button', { class: 'composer-logo', id: 'burnToggle', type: 'button', title: 'Тип сообщения: обычный ✉️' }, '✉️'),
       h('textarea', { id: 'msgInput', placeholder: 'Сообщение…', rows: '1' }),
       h('button', { class: 'attach-btn', id: 'attachBtn', type: 'button', title: 'Прикрепить файл' }, '📎'),
       h('button', { class: 'rec-round', id: 'recBtn', type: 'button', 'data-mode': 'voice', title: 'Удерживай — запись · тап — сменить режим' }, '🎤'),
@@ -602,6 +636,21 @@ function renderMain() {
   $('#sendBtn').addEventListener('click', sendMessage);
   $('#attachBtn').addEventListener('click', () => $('#fileInput').click());
   bindRecButton();
+  const burnToggle = $('#burnToggle');
+  if (burnToggle) {
+    const paintBurn = () => {
+      const on = !!state.burn;
+      burnToggle.textContent = on ? '🔥' : '✉️';
+      burnToggle.classList.toggle('burn-on', on);
+      burnToggle.title = on ? 'Сгорающие сообщения 🔥 (10 секунд)' : 'Тип сообщения: обычный ✉️';
+    };
+    paintBurn();
+    burnToggle.addEventListener('click', () => {
+      state.burn = !state.burn;
+      paintBurn();
+      toast(state.burn ? 'Сгорающие сообщения 🔥' : 'Обычные сообщения ✉️', state.burn ? 'err' : 'ok');
+    });
+  }
   const jumpDown = $('#jumpDown');
   if (jumpDown) {
     const jb = $('#chatBody');
@@ -641,6 +690,18 @@ async function loadFriends() {
   renderFriends();
 }
 
+// ---------- закреплённые чаты (пины) ----------
+function getPins() { try { return JSON.parse(localStorage.getItem('sk_pins') || '[]'); } catch (e) { return []; } }
+function setPins(p) { try { localStorage.setItem('sk_pins', JSON.stringify(p)); } catch (e) {} }
+function isPinned(nick) { return getPins().includes(String(nick).toLowerCase()); }
+function togglePin(nick) {
+  const p = getPins(), k = String(nick).toLowerCase();
+  const i = p.indexOf(k);
+  if (i >= 0) p.splice(i, 1); else p.unshift(k);
+  setPins(p);
+  renderFriends(); updateChatHeader();
+}
+
 function renderFriends() {
   const list = $('#friendList');
   if (!list) return;
@@ -651,13 +712,26 @@ function renderFriends() {
     list.append(h('div', { class: 'empty-note' }, 'Пока никого нет.\nНайди друга по имени выше 👆'));
     return;
   }
-  for (const f of state.friends) {
+  // закреплённые — первыми, в порядке пина
+  const pins = getPins();
+  const sorted = state.friends.slice().sort((a, b) => {
+    const ka = String(a.nick).toLowerCase(), kb = String(b.nick).toLowerCase();
+    const pa = pins.indexOf(ka), pb = pins.indexOf(kb);
+    if (pa < 0 && pb >= 0) return 1;
+    if (pb < 0 && pa >= 0) return -1;
+    if (pa < 0) return 0;
+    return pa - pb;
+  });
+  for (const f of sorted) {
     const online = !!f.online;
     const unread = state.unread[f.nick.toLowerCase()] || 0;
+    const pinned = pins.includes(String(f.nick).toLowerCase());
     const item = h('div', { class: 'friend-item' + (state.conv === f.nick ? ' on' : ''), id: 'fr-' + hashNick(f.nick) },
       avatarEl(f.nick),
       h('div', { class: 'friend-info' },
-        h('div', { class: 'friend-name' }, f.nick, h('span', { class: 'dot' + (online ? ' on' : '') })),
+        h('div', { class: 'friend-name' }, f.nick,
+          pinned ? h('span', { class: 'pin-ic' }, '📌') : null,
+          h('span', { class: 'dot' + (online ? ' on' : '') })),
         h('div', { class: 'friend-sub' }, online ? 'онлайн' : 'не в сети')
       ),
       unread ? h('div', { class: 'unread' }, unread) : null
@@ -919,7 +993,18 @@ async function openGuildChannel(guild, ch) {
   if (input) input.placeholder = ch.kind === 'voice' ? 'В голосовом канале пишут…' : 'Сообщение в канал…';
 
   if (ch.kind === 'voice') {
-    openVoiceCall(guild, ch);
+    // вход в звонок — отдельная кнопка: клик даёт браузеру жест,
+    // без которого autoplay со звуком заблокирован (не слышно собеседника)
+    const chatInput = $('#chatInput');
+    if (chatInput) chatInput.style.display = 'none';
+    body.replaceChildren(
+      h('div', { class: 'call-panel', id: 'callPanel' },
+        h('div', { class: 'call-status', id: 'callStatus' }, '🔊 ' + ch.name),
+        h('div', { class: 'call-sub', id: 'callSub' }, 'Голосовой канал · ' + guild.name),
+        h('button', { class: 'call-btn join-voice', id: 'callJoinBtn', type: 'button', title: 'Войти в звонок' }, '🔊 Присоединиться')
+      )
+    );
+    $('#callJoinBtn').addEventListener('click', () => openVoiceCall(guild, ch));
     return;
   }
 
@@ -970,7 +1055,7 @@ function buildCallPanel(mode) {
     status.textContent = 'Ожидание собеседника…';
     timer.textContent = fmtWait(15 * 60);
   }
-  return h('div', { class: 'call-panel' }, status, timer, videos, controls);
+  return h('div', { class: 'call-panel', id: 'callPanel' }, status, timer, videos, controls);
 }
 
 function fmtWait(sec) {
@@ -985,22 +1070,36 @@ async function openVoiceCall(guild, ch) {
   if (input) input.style.display = 'none';
   const body = $('#chatBody');
   if (body) body.replaceChildren(buildCallPanel('waiting'));
+  // автоплей со звуком может блокироваться браузером: любой клик по панели
+  // снимает mute и запускает воспроизведение всех видео
+  const panel = $('#callPanel');
+  if (panel) panel.addEventListener('click', () => {
+    const vs = panel.querySelectorAll('video');
+    for (const v of vs) {
+      if (v.closest('.call-video.local')) tryPlayLocal(v);
+      else tryPlay(v);
+    }
+  });
   call = {
     guildId: guild.id, channelId: ch.id, guild, ch,
     peers: new Map(), pcMap: new Map(), mySid: null,
     localStream: null, camStream: null, screenStream: null,
+    sendStream: new MediaStream(),
     micOn: true, camOn: false, screenOn: false,
-    waitMs: CALL_WAIT_MS, waitTimer: null, closed: false
+    waitMs: CALL_WAIT_MS, waitTimer: null, closed: false,
+    noMediaSince: null, reconnectBusy: false,
+    screenPeers: {}
   };
-  $('.call-btn') && (() => {})();
   document.getElementById('callMic').addEventListener('click', toggleMic);
   document.getElementById('callCam').addEventListener('click', toggleCam);
   document.getElementById('callScreen').addEventListener('click', toggleScreen);
   document.getElementById('callLeave').addEventListener('click', () => leaveCall('Ты вышел из звонка'));
   startWaitTimer();
+  startCallTick();
   // захват микрофона и вход в комнату
   try {
     call.localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    for (const t of call.localStream.getAudioTracks()) call.sendStream.addTrack(t);
   } catch (e) {
     toast('Не удалось включить микрофон: ' + (e.message || e), 'err');
   }
@@ -1038,18 +1137,37 @@ function renderCallPeers() {
   const videos = $('#callVideos');
   if (!videos) return;
   const meLower = String(state.me).toLowerCase();
-  videos.replaceChildren(callVideoBox(meLower, true));
+  // Локальный бокс переиспользуем — не теряем srcObject
+  let localBox = videos.querySelector('.call-video.local');
+  if (!localBox) {
+    localBox = callVideoBox(meLower, true);
+    videos.append(localBox);
+  }
+  const wanted = new Set();
+  wanted.add('__local__');
   for (const [sid, nick] of call.peers) {
     const nickL = String(nick).toLowerCase();
-    const box = callVideoBox(nickL === meLower ? nick + ' · устройство' : nick, false);
-    box.dataset.peer = sid;
-    videos.append(box);
-    const v = box.querySelector('video');
-    if (v) {
-      v.muted = false;
-      v.autoplay = true;
-      v.playsInline = true;
+    wanted.add(sid);
+    let box = videos.querySelector(`[data-peer="${sid}"]`);
+    if (!box) {
+      box = callVideoBox(nickL === meLower ? nick + ' · устройство' : nick, false);
+      box.dataset.peer = sid;
+      videos.append(box);
+      const v = box.querySelector('video');
+      if (v) { v.muted = false; v.autoplay = true; v.playsInline = true; tryPlay(v); }
+    } else {
+      const nm = box.querySelector('.call-name');
+      if (nm && !box.classList.contains('local')) {
+        const label = nickL === meLower ? nick + ' · устройство' : nick;
+        if (nm.textContent !== label) nm.textContent = label;
+      }
     }
+  }
+  // удаляем осиротевшие боксы (вышедшие пиры)
+  for (const box of Array.prototype.slice.call(videos.children)) {
+    if (box.classList.contains('local')) continue;
+    const sid = box.dataset.peer;
+    if (!sid || !wanted.has(sid)) box.remove();
   }
   if (call.peers.size >= 1) {
     setCallStatus('Звонок идёт · ' + (call.peers.size + 1) + ' участн.');
@@ -1060,6 +1178,24 @@ function renderCallPeers() {
     const t = $('#callWaitTimer');
     if (t) t.style.display = '';
   }
+  updateScreenLayout();
+}
+
+// Демонстрация экрана собеседника — крупно (на маленькой карточке плохо видно)
+function updateScreenLayout() {
+  if (!call) return;
+  const videos = $('#callVideos');
+  let any = false;
+  if (videos) {
+    for (const box of Array.prototype.slice.call(videos.children)) {
+      const sid = box.dataset.peer;
+      const on = !!(call.screenPeers || {})[sid];
+      box.classList.toggle('screen-on', on);
+      if (on) any = true;
+    }
+  }
+  const panel = $('#callPanel');
+  if (panel) panel.classList.toggle('has-screen', any);
 }
 
 function updateVoicePeers(peers) {
@@ -1078,37 +1214,183 @@ function updateVoicePeers(peers) {
   }
 }
 
-async function ensurePeer(sid, nick) {
-  if (!call || call.closed) return;
-  if (!sid || call.pcMap.has(sid)) return;
-  const pc = new RTCPeerConnection({ iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' }
-  ] });
+const ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478', 'stun:stun.stunprotocol.org:3478'] },
+  { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'], username: 'openrelayproject', credential: 'openrelayproject' }
+];
+
+// Единая фабрика peer-соединения: все треки отправляются в ОДНОМ MediaStream
+// (call.sendStream), чтобы получатель получал аудио и видео одним событием ontrack.
+// Приводим набор передающих треков peer'а в точное соответствие с sendStream:
+// убираем лишние senders и добавляем недостающие треки. Без этого после смены
+// камеры/экрана предложенный SDP может не отражать актуальный состав медиа.
+async function syncTracksToPeer(pc) {
+  const want = call.sendStream.getTracks();
+  for (const sender of pc.getSenders()) {
+    if (sender.track && !want.includes(sender.track)) {
+      try { pc.removeTrack(sender); } catch (e) {}
+    }
+  }
+  for (const t of want) {
+    const has = pc.getSenders().some(s => s.track === t);
+    if (!has) { try { pc.addTrack(t, call.sendStream); } catch (e) {} }
+  }
+  // ограничиваем битрейт: камера ~1.2 Мбит/с, экран ~2.5 Мбит/с,
+  // аудио ~64 Кбит/с — иначе на телефоне/слабом канале всё лагает
+  for (const sender of pc.getSenders()) {
+    if (!sender.track) continue;
+    try {
+      const p = sender.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = sender.track.kind === 'audio' ? 64000 : (call.screenOn ? 5000000 : 1200000);
+      p.degradationPreference = 'maintain-framerate';
+      await sender.setParameters(p);
+    } catch (e) {}
+  }
+}
+
+function createPeer(sid) {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
   call.pcMap.set(sid, pc);
   pc.onicecandidate = e => {
     if (e.candidate && !call.closed) {
       wsMessage({ type: 'voice-signal', to: sid, signal: { kind: 'ice', candidate: e.candidate } });
     }
   };
-  pc.ontrack = e => {
-    const box = attachRemoteStream(sid, e.streams[0] || new MediaStream([e.track]));
-    if (box) box.dataset.peer = sid;
+  pc.ontrack = e => attachRemoteStream(sid, e.streams[0] || new MediaStream([e.track]));
+  pc.onconnectionstatechange = () => {
+    if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] conn', sid, pc.connectionState);
   };
-  if (call.localStream) {
-    for (const t of call.localStream.getTracks()) pc.addTrack(t, call.localStream);
+  syncTracksToPeer(pc).catch(() => {});
+  return pc;
+}
+
+// После изменения набора треков (камера/экран) нужно заново обменяться SDP:
+// без renegotiation получатель не узнает о новых/удалённых дорожках.
+async function negotiateAll() {
+  if (!call || call.closed) return;
+  for (const [sid, pc] of call.pcMap) {
+    if (!isPolite(sid) && pc.signalingState !== 'stable') continue; // impolite: не мешаем текущей негotiation
+    try {
+      await syncTracksToPeer(pc);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] renegotiate ->', sid);
+      wsMessage({ type: 'voice-signal', to: sid, signal: { kind: 'offer', sdp: pc.localDescription } });
+    } catch (e) { /* ignore */ }
   }
-  if (call.screenStream) {
-    for (const t of call.screenStream.getTracks()) pc.addTrack(t, call.screenStream);
-  } else if (call.camStream) {
-    for (const t of call.camStream.getTracks()) pc.addTrack(t, call.camStream);
-  }
+}
+
+async function ensurePeer(sid, nick) {
+  if (!call || call.closed) return;
+  if (!sid || call.pcMap.has(sid)) return;
+  const pc = createPeer(sid);
+  if (!isPolite(sid) && pc.signalingState !== 'stable') return;
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   if (!call.closed) {
     if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] sig offer ->', sid);
     wsMessage({ type: 'voice-signal', to: sid, signal: { kind: 'offer', sdp: pc.localDescription } });
   }
+}
+
+function tryPlay(v) {
+  if (!v) return;
+  try { v.muted = false; if (v.paused) v.play().catch(() => {}); } catch (e) {}
+}
+
+// Локальный бокс (свой микрофон/камера/экран) НИКОГДА не должен
+// воспроизводить звук — иначе слышно самого себя
+function tryPlayLocal(v) {
+  if (!v) return;
+  try { v.muted = true; if (v.paused) v.play().catch(() => {}); } catch (e) {}
+}
+
+// Ищем видео-sender: сначала активный, иначе «пустой» (track=null после
+// выключения камеры) — чтобы не плодить новые senders при каждом включении
+function videoSenderOf(pc) {
+  const st = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  if (st) return st;
+  const tr = pc.getTransceivers().find(t => t.sender && t.sender.track === null && t.receiver && t.receiver.track && t.receiver.track.kind === 'video');
+  if (tr) return tr.sender;
+  const tr2 = pc.getTransceivers().find(t => t.sender && t.sender.track === null);
+  return tr2 ? tr2.sender : null;
+}
+
+// Видео-карточка: если видео-треков нет (или все ended) — прячем <video>, показываем аватарку
+function syncVideoBoxState(box) {
+  if (!box) return;
+  const v = box.querySelector('video');
+  let hasVideo = false;
+  if (v && v.srcObject) {
+    const tracks = v.srcObject.getVideoTracks();
+    hasVideo = tracks.some(t => t.readyState !== 'ended');
+  }
+  box.classList.toggle('no-video', !hasVideo);
+  if (v && hasVideo) {
+    if (box.classList.contains('local')) tryPlayLocal(v);
+    else tryPlay(v);
+  }
+}
+
+// Локальная карточка: синхронизируем с составом sendStream
+function refreshLocalVideoBox() {
+  if (!call) return;
+  const box = document.querySelector('#callVideos .call-video.local');
+  if (!box) return;
+  const v = box.querySelector('video');
+  const hasVideo = call.sendStream.getVideoTracks().some(t => t.readyState !== 'ended');
+  if (hasVideo) {
+    if (v) {
+      v.muted = true;
+      if (v.srcObject !== call.sendStream) v.srcObject = call.sendStream;
+      tryPlayLocal(v);
+    }
+  } else {
+    if (v && v.srcObject === call.sendStream) v.removeAttribute('srcObject');
+  }
+  box.classList.toggle('no-video', !hasVideo);
+}
+
+// Периодический контроль карточек: готовность remote-треков меняется
+// не всегда через события (removeTrack при renegotiation не генерирует removetrack),
+// поэтому раз в секунду пересчитываем видимость видео
+async function reconnectAllPeers() {
+  if (!call || call.closed || call.reconnectBusy) return;
+  call.reconnectBusy = true;
+  if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] no media — reconnect peers');
+  for (const pc of call.pcMap.values()) { try { pc.close(); } catch (e) {} }
+  call.pcMap.clear();
+  call.noMediaSince = null;
+  for (const [sid, nick] of call.peers) {
+    try { await ensurePeer(sid, nick); } catch (e) {}
+  }
+  call.reconnectBusy = false;
+}
+
+function startCallTick() {
+  if (!call || call.tickTimer) return;
+  call.tickTimer = setInterval(() => {
+    if (!call || call.closed) { clearInterval(call.tickTimer); call.tickTimer = null; return; }
+    const videos = $('#callVideos');
+    if (videos) {
+      for (const box of Array.prototype.slice.call(videos.children)) syncVideoBoxState(box);
+    }
+    refreshLocalVideoBox();
+    // если пиры есть, но 12 секунд нет ни одного remote-трека — пересоздаём соединения
+    if (call.peers.size >= 1) {
+      const hasRemote = Array.prototype.some.call(videos ? videos.querySelectorAll('.call-video:not(.local) video') : [], v => !!(v.srcObject && v.srcObject.getTracks().length));
+      if (hasRemote) {
+        call.noMediaSince = null;
+      } else if (!call.noMediaSince) {
+        call.noMediaSince = Date.now();
+      } else if (Date.now() - call.noMediaSince > 12000 && !call.reconnectBusy) {
+        reconnectAllPeers();
+      }
+    } else {
+      call.noMediaSince = null;
+    }
+  }, 1000);
 }
 
 function attachRemoteStream(sid, stream) {
@@ -1122,8 +1404,29 @@ function attachRemoteStream(sid, stream) {
     videos.append(box);
   }
   const v = box.querySelector('video');
-  if (v && !v.srcObject) { v.srcObject = stream; v.muted = false; v.autoplay = true; v.playsInline = true; }
+  if (v) {
+    if (!v.srcObject) v.srcObject = new MediaStream();
+    const existing = new Set(v.srcObject.getTracks());
+    for (const t of stream.getTracks()) if (!existing.has(t)) v.srcObject.addTrack(t);
+    const s = v.srcObject;
+    if (!box.__streamHooked) {
+      box.__streamHooked = true;
+      const upd = () => syncVideoBoxState(box);
+      s.addEventListener('addtrack', upd);
+      s.addEventListener('removetrack', upd);
+    }
+    syncVideoBoxState(box);
+    setTimeout(() => syncVideoBoxState(box), 500);
+  }
   return box;
+}
+
+// Perfect Negotiation: при одновременном обмене offers (glare) один пир — polite,
+// второй — impolite. Impolite игнорирует входящий offer, пока сам не получит answer,
+// polite откатывает свой offer и отвечает. Это устраняет «перекрёстные» SDP,
+// из-за которых соединение падало (conn failed).
+function isPolite(sid) {
+  return String(call.mySid) < String(sid);
 }
 
 async function handleVoiceSignal(fromSid, signal) {
@@ -1131,22 +1434,28 @@ async function handleVoiceSignal(fromSid, signal) {
   if (!fromSid || fromSid === call.mySid) return;
   if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] sig recv', signal && signal.kind, 'from', fromSid);
   if (signal.kind === 'offer') {
-    if (!call.pcMap.has(fromSid)) {
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-      call.pcMap.set(fromSid, pc);
-      pc.onicecandidate = e => { if (e.candidate && !call.closed) wsMessage({ type: 'voice-signal', to: fromSid, signal: { kind: 'ice', candidate: e.candidate } }); };
-      pc.ontrack = e => attachRemoteStream(fromSid, e.streams[0] || new MediaStream([e.track]));
-      if (call.localStream) for (const t of call.localStream.getTracks()) pc.addTrack(t, call.localStream);
-      if (call.screenStream) for (const t of call.screenStream.getTracks()) pc.addTrack(t, call.screenStream);
-      else if (call.camStream) for (const t of call.camStream.getTracks()) pc.addTrack(t, call.camStream);
-    }
+    if (!call.pcMap.has(fromSid)) createPeer(fromSid);
     const pc = call.pcMap.get(fromSid);
+    const polite = isPolite(fromSid);
     try {
+      if (pc.signalingState !== 'stable') {
+        const haveLocalOffer = pc.signalingState === 'have-local-offer';
+        if (!polite && haveLocalOffer) {
+          // impolite: у нас уже есть неподтверждённый offer — входящий игнорируем
+          if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] glare: impolite ignores offer', fromSid);
+          return;
+        }
+        // polite (или уже получили remote offer): откатываем свой offer
+        try { await pc.setLocalDescription({ type: 'rollback' }); }
+        catch (e) {}
+      }
       await pc.setRemoteDescription(signal.sdp);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      wsMessage({ type: 'voice-signal', to: fromSid, signal: { kind: 'answer', sdp: pc.localDescription } });
-    } catch (e) { /* ignore */ }
+      if (pc.signalingState === 'have-remote-offer') {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        wsMessage({ type: 'voice-signal', to: fromSid, signal: { kind: 'answer', sdp: pc.localDescription } });
+      }
+    } catch (e) { console.info('[voice] offer err', e && e.message); }
   } else if (signal.kind === 'answer') {
     const pc = call.pcMap.get(fromSid);
     if (pc) { try { await pc.setRemoteDescription(signal.sdp); } catch (e) {} }
@@ -1174,25 +1483,47 @@ function toggleMic() {
 
 async function toggleCam() {
   if (!call) return;
-  call.camOn = !call.camOn;
   const b = $('#callCam');
-  const meL = String(state.me).toLowerCase();
-  if (call.camOn) {
-    try {
-      if (!call.camStream) call.camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-      call.camStream.getVideoTracks().forEach(t => t.enabled = true);
-      for (const pc of call.pcMap.values()) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(call.camStream.getVideoTracks()[0]).catch(() => {});
-        else call.camStream.getVideoTracks().forEach(t => pc.addTrack(t, call.camStream));
+  if (!call.camOn) {
+    // включить камеру (если идёт демонстрация экрана — сначала выключить её)
+    if (call.screenOn) {
+      call.screenOn = false;
+      if (call.screenStream) {
+        const st = call.screenStream.getVideoTracks()[0];
+        if (st) call.sendStream.removeTrack(st);
       }
-      const v = document.querySelector('#callVideos .call-video.local video');
-      if (v) v.srcObject = call.camStream;
-    } catch (e) { toast('Не удалось включить камеру', 'err'); call.camOn = false; }
+      stopScreenShareTracks();
+    }
+    try {
+      if (call.camStream) { stopStream(call.camStream); call.camStream = null; }
+      call.camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, frameRate: { ideal: 24, max: 30 } } });
+      const vTrack = call.camStream.getVideoTracks()[0];
+      call.sendStream.addTrack(vTrack);
+      for (const pc of call.pcMap.values()) {
+        const sender = videoSenderOf(pc);
+        if (sender) { try { await sender.replaceTrack(vTrack); } catch (e) {} }
+        else { try { pc.addTrack(vTrack, call.sendStream); } catch (e) {} }
+      }
+      call.camOn = true;
+      refreshLocalVideoBox();
+      await negotiateAll();
+    } catch (e) {
+      call.camOn = false;
+      refreshLocalVideoBox();
+      toast('Не удалось включить камеру', 'err');
+    }
   } else {
-    if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = false);
-    const v = document.querySelector('#callVideos .call-video.local video');
-    if (v && v.srcObject === call.camStream) v.removeAttribute('srcObject');
+    // выключить камеру: реально остановить захват (чтобы индикатор погас)
+    call.camOn = false;
+    const vTrack = call.camStream ? call.camStream.getVideoTracks()[0] : null;
+    if (vTrack) call.sendStream.removeTrack(vTrack);
+    for (const pc of call.pcMap.values()) {
+      const sender = videoSenderOf(pc);
+      if (sender) { try { await sender.replaceTrack(null); } catch (e) {} }
+    }
+    if (call.camStream) { stopStream(call.camStream); call.camStream = null; }
+    refreshLocalVideoBox();
+    await negotiateAll();
   }
   if (b) b.classList.toggle('on', call.camOn);
 }
@@ -1205,29 +1536,51 @@ async function toggleScreen() {
   if (!call) return;
   const b = $('#callScreen');
   if (call.screenOn) {
-    // выключить демонстрацию: вернуть видео камеры (или ничего)
+    // выключить демонстрацию: вернуть видео камеры (если включена)
     call.screenOn = false;
-    if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = true);
+    let nextTrack = null;
+    if (call.screenStream) {
+      const st = call.screenStream.getVideoTracks()[0];
+      if (st) call.sendStream.removeTrack(st);
+    }
+    if (call.camOn && call.camStream) nextTrack = call.camStream.getVideoTracks()[0] || null;
+    if (nextTrack) call.sendStream.addTrack(nextTrack);
     for (const pc of call.pcMap.values()) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender && call.camStream) await sender.replaceTrack(call.camStream.getVideoTracks()[0]).catch(() => {});
-      else if (sender) await sender.replaceTrack(null).catch(() => {});
+      const sender = videoSenderOf(pc);
+      if (sender) { try { await sender.replaceTrack(nextTrack); } catch (e) {} }
     }
     stopScreenShareTracks();
+    refreshLocalVideoBox();
+    await negotiateAll();
+    wsMessage({ type: 'voice-screen', on: false });
+    updateScreenLayout();
   } else {
     try {
-      call.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-      call.screenOn = true;
-      if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = false);
-      for (const pc of call.pcMap.values()) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(call.screenStream.getVideoTracks()[0]).catch(() => {});
-        else call.screenStream.getVideoTracks().forEach(t => pc.addTrack(t, call.screenStream));
+      call.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 } } });
+      const st = call.screenStream.getVideoTracks()[0];
+      // камеру с дорожки убираем: на демонстрации показываем только экран
+      if (call.camOn && call.camStream) {
+        const ct = call.camStream.getVideoTracks()[0];
+        if (ct) call.sendStream.removeTrack(ct);
       }
-      const v = document.querySelector('#callVideos .call-video.local video');
-      if (v) v.srcObject = call.screenStream;
-      call.screenStream.getVideoTracks()[0].addEventListener('ended', () => { if (call.screenOn) toggleScreen(); });
-    } catch (e) { call.screenOn = false; }
+      call.sendStream.addTrack(st);
+      for (const pc of call.pcMap.values()) {
+        const sender = videoSenderOf(pc);
+        if (sender) { try { await sender.replaceTrack(st); } catch (e) {} }
+        else { try { pc.addTrack(st, call.sendStream); } catch (e) {} }
+      }
+      call.screenOn = true;
+      refreshLocalVideoBox();
+      st.addEventListener('ended', () => { if (call && call.screenOn) toggleScreen(); });
+      await negotiateAll();
+      wsMessage({ type: 'voice-screen', on: true });
+      updateScreenLayout();
+    } catch (e) {
+      call.screenOn = false;
+      refreshLocalVideoBox();
+      toast(e && e.name === 'NotAllowedError' ? 'Доступ к экрану не разрешён — выбери экран/окно/вкладку' : 'Не удалось начать демонстрацию экрана', 'err');
+      if (call.screenStream) { stopStream(call.screenStream); call.screenStream = null; }
+    }
   }
   if (b) b.classList.toggle('on', call.screenOn);
 }
@@ -1236,6 +1589,7 @@ function closeCall(notify) {
   if (!call) return;
   call.closed = true;
   if (call.waitTimer) { clearInterval(call.waitTimer); call.waitTimer = null; }
+  if (call.tickTimer) { clearInterval(call.tickTimer); call.tickTimer = null; }
   closeAllPeers();
   stopStream(call.localStream); stopStream(call.camStream); stopScreenShareTracks();
   call = null;
@@ -1530,7 +1884,9 @@ async function openChat(nick) {
       okCnt++;
       const day = new Date(m.ts).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
       if (day !== lastDay) { lastDay = day; nodes.push(h('div', { class: 'day-sep' }, day.charAt(0).toUpperCase() + day.slice(1))); }
-      nodes.push(msgEl(m, pt));
+      const node = msgEl(m, pt);
+      nodes.push(node);
+      if (m.burn) armBurn(node, m);
       if (m.ts > state.lastTs) state.lastTs = m.ts;
     }
     const bodyNow = $('#chatBody');
@@ -1613,7 +1969,42 @@ function msgEl(m, text) {
   }
 
   row.append(bubble);
+
+  // свои сообщения можно удалить (крестик слева от пузыря)
+  if (mine && !state.gview) {
+    const del = h('button', { class: 'msg-del', type: 'button', title: 'Удалить сообщение' }, '✕');
+    del.addEventListener('click', () => deleteMyMsg(m));
+    bubble.append(del);
+  }
+
+  // сгорающее: помечаем пузырь, таймер запустится при попадании в DOM
+  if (m.burn) bubble.classList.add('is-burn');
+
   return row;
+}
+
+// Сгорающее сообщение: исчезает из чата через 10 секунд после отправки.
+function armBurn(row, m) {
+  if (!row || !m || !m.burn) return;
+  const ttl = 10000 - (Date.now() - (Number(m.ts) || Date.now()));
+  if (ttl <= 0) { if (row.parentNode) row.parentNode.removeChild(row); return; }
+  setTimeout(() => {
+    if (!row.parentNode) return;
+    row.classList.add('burning');
+    setTimeout(() => { if (row.parentNode) row.parentNode.removeChild(row); }, 450);
+  }, ttl);
+}
+
+async function deleteMyMsg(m) {
+  if (!m || !state.conv || state.gview) return;
+  const ok = await askConfirm('Удалить сообщение?', 'Оно исчезнет у обоих — и у тебя, и у собеседника.');
+  if (!ok) return;
+  try {
+    await api('DELETE', '/api/msg/' + m.id + '?conv=' + encodeURIComponent(state.conv));
+    const row = document.querySelector(`#chatBody [data-id="${m.id}"]`);
+    if (row && row.parentNode) row.parentNode.removeChild(row);
+    toast('Сообщение удалено');
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 // Полная метка времени для подсказки («21 ноября, 03:01»)
@@ -1741,6 +2132,7 @@ function appendReceived(m, text, force) {
   if (isNewDay) body.append(h('div', { class: 'day-sep' }, dayKey));
   const row = msgEl(m, text);
   body.append(row);
+  armBurn(row, m);
   if (isNewDay) row.classList.remove('grouped');
   else markGrouped(Array.prototype.slice.call(body.querySelectorAll('.msg-row'), -2));
   scrollChat(force);
@@ -1774,8 +2166,8 @@ async function sendMessage() {
   try {
     const aad = convKey(state.me, state.conv);
     const body = await window.SecCrypto.sealMessage(state.shared, text, aad);
-    const r = await api('POST', '/api/msg', { to: state.conv, body });
-    const m = { id: r.id, from: state.me, ts: r.ts };
+    const r = await api('POST', '/api/msg', { to: state.conv, body, burn: state.burn });
+    const m = { id: r.id, from: state.me, ts: r.ts, burn: state.burn };
     appendReceived(m, text, true);
     if (r.ts > state.lastTs) state.lastTs = r.ts;
     input.value = ''; input.style.height = 'auto'; syncComposer(input);
@@ -1810,8 +2202,8 @@ async function sendEncodedMedia(buf, name, mime, size, meta) {
   const up = await api('POST', '/api/media', { to: state.conv, name, mime, size, b64: env });
   const body = JSON.stringify({ t: meta.t || 'file', id: up.id, n: name, m: mime, s: up.size, d: meta.d || 0 });
   const sealed = await window.SecCrypto.sealMessage(state.shared, body, aad);
-  const r = await api('POST', '/api/msg', { to: state.conv, body: sealed });
-  const m = { id: r.id, from: state.me, ts: r.ts };
+  const r = await api('POST', '/api/msg', { to: state.conv, body: sealed, burn: state.burn });
+  const m = { id: r.id, from: state.me, ts: r.ts, burn: state.burn };
   appendReceived(m, body, true);
   if (r.ts > state.lastTs) state.lastTs = r.ts;
 }
@@ -2003,16 +2395,36 @@ function voiceCard(meta) {
 
 function showChatMenu() {
   if (!state.conv) return;
+  const nick = state.conv;
+  const pinned = isPinned(nick);
   const modal = h('div', { class: 'modal' },
-    h('h3', {}, state.conv),
+    h('h3', {}, nick),
     h('p', {}, 'Действия с этим диалогом:'),
-    h('button', { class: 'btn-danger', style: 'width:100%', type: 'button' }, 'Удалить из друзей')
+    h('button', { class: 'btn', style: 'width:100%', type: 'button' }, pinned ? '📍 Открепить чат' : '📌 Закрепить чат'),
+    h('button', { class: 'btn-danger', style: 'width:100%;margin-top:8px', type: 'button' }, '🗑 Удалить чат'),
+    h('button', { class: 'btn-danger', style: 'width:100%;margin-top:8px', type: 'button' }, 'Удалить из друзей')
   );
-  modal.querySelector('button').addEventListener('click', async () => {
+  const [pinBtn, delChatBtn, delFriendBtn] = modal.querySelectorAll('button');
+  pinBtn.addEventListener('click', () => { togglePin(nick); closeModal(); toast(pinned ? 'Чат откреплён' : 'Чат закреплён 📌'); });
+  delChatBtn.addEventListener('click', async () => {
+    const ok = await askConfirm('Удалить чат?', 'Переписка с «' + nick + '» удалится у обоих. Сам друг останется в списке.');
+    if (!ok) return;
     try {
-      await api('POST', '/api/friend/remove', { nick: state.conv });
-      state.friends = state.friends.filter(x => x.nick !== state.conv);
-      state.conv = null; state.shared = null; state.lastTs = 0;
+      await api('DELETE', '/api/conv?nick=' + encodeURIComponent(nick));
+      if (state.conv === nick) {
+        state.conv = null; state.shared = null; state.lastTs = 0; state.msgs = [];
+        const body = $('#chatBody');
+        if (body) body.replaceChildren(h('div', { class: 'empty-note' }, 'Выбери друга слева 💬'));
+      }
+      closeModal(); renderFriends();
+      toast('Чат удалён');
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  delFriendBtn.addEventListener('click', async () => {
+    try {
+      await api('POST', '/api/friend/remove', { nick });
+      state.friends = state.friends.filter(x => x.nick !== nick);
+      if (state.conv === nick) { state.conv = null; state.shared = null; state.lastTs = 0; }
       closeModal(); renderFriends(); renderMain();
       toast('Удалено');
     } catch (e) { toast(e.message, 'err'); }
@@ -2033,7 +2445,18 @@ function connectWS() {
   ws.onmessage = e => {
     let m;
     try { m = JSON.parse(e.data); } catch (_) { return; }
-    if (m.type === 'presence') {
+    if (m.type === 'msg-deleted') {
+      const row = document.querySelector(`#chatBody [data-id="${m.id}"]`);
+      if (row && row.parentNode) row.parentNode.removeChild(row);
+    } else if (m.type === 'conv-deleted') {
+      if (state.conv === m.nick) {
+        state.conv = null; state.shared = null; state.lastTs = 0; state.msgs = [];
+        const body = $('#chatBody');
+        if (body) body.replaceChildren(h('div', { class: 'empty-note' }, 'Переписка удалена собеседником 🗑'));
+        renderFriends();
+        toast(m.nick + ' удалил(а) переписку', 'err');
+      }
+    } else if (m.type === 'presence') {
       const f = state.friends.find(x => x.nick === m.nick);
       if (f) { f.online = m.online; renderFriends(); updateChatHeader(); }
     } else if (m.type === 'msg') {
@@ -2089,6 +2512,15 @@ function connectWS() {
       }
     } else if (m.type === 'voice-signal') {
       handleVoiceSignal(m.from, m.signal).catch(() => {});
+    } else if (m.type === 'voice-screen') {
+      if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] screen event from', m.from, m.on);
+      if (call && !call.closed) {
+        call.screenPeers = call.screenPeers || {};
+        call.screenPeers[m.from] = !!m.on;
+        updateScreenLayout();
+        try { window.__screenSeen = true; } catch (e) {}
+        if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] screen box', !!document.querySelector('.call-video.screen-on'), document.querySelector('#callPanel.has-screen') ? 'has-screen' : 'no-screen');
+      }
     }
   };
 
@@ -2120,7 +2552,9 @@ async function pollTick() {
           if (body.querySelector(`[data-id="${m.id}"]`)) continue;
           const pt = await window.SecCrypto.openMessage(state.shared, m.body, aad);
           if (pt == null) continue;
-          body.append(msgEl(m, pt));
+          const node = msgEl(m, pt);
+          body.append(node);
+          armBurn(node, m);
           if (m.ts > state.lastTs) state.lastTs = m.ts;
         }
         scrollChat();
@@ -2149,6 +2583,13 @@ function updateChatHeader() {
   if (st) st.textContent = f.online ? 'онлайн' : 'не в сети';
   const dot = $('#chatTitle .dot');
   if (dot) dot.classList.toggle('on', !!f.online);
+  const title = $('#chatTitle');
+  if (title) {
+    const pin = title.querySelector('.pin-ic');
+    if (isPinned(state.conv)) {
+      if (!pin) title.prepend(h('span', { class: 'pin-ic' }, '📌'));
+    } else if (pin) pin.remove();
+  }
   const rps = $('#rpStatus');
   if (rps) {
     rps.textContent = f.online ? '🟢 онлайн' : '⚪ не в сети';
