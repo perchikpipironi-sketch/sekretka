@@ -99,10 +99,66 @@ function sendTo(nick, obj) {
   return sent;
 }
 
+// ---------- голосовые комнаты (звонки в каналах) ----------
+// Комната хранит соединения: sessionId (sid) -> nick (нижний регистр).
+// У одного ника может быть несколько устройств/вкладок — каждое получает
+// собственный sid и видит остальные соединения как отдельных «участников».
+// Сигналы WebRTC ретранслируются точечно от одного sid к другому.
+const voiceRooms = new Map(); // `${guildId}:${channelId}` -> Map<sid, nick>
+const voiceSockets = new Map(); // sid -> ws
+let voiceSeq = 1;
+function voiceRoomKey(guildId, channelId) { return String(guildId) + ':' + String(channelId); }
+function voicePeers(guildId, channelId) {
+  const room = voiceRooms.get(voiceRoomKey(guildId, channelId));
+  if (!room) return [];
+  const out = [];
+  for (const [sid, nick] of room) out.push({ sid, nick });
+  return out;
+}
+function voiceBroadcast(key, exceptSid, obj) {
+  const room = voiceRooms.get(key);
+  if (!room) return;
+  const data = JSON.stringify(obj);
+  for (const sid of room.keys()) {
+    if (sid === exceptSid) continue;
+    const ws = voiceSockets.get(sid);
+    if (ws && ws.readyState === 1) { try { ws.send(data); } catch (e) {} }
+  }
+}
+function voiceSendSid(sid, obj) {
+  const ws = voiceSockets.get(sid);
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify(obj)); return true; } catch (e) {} 
+  }
+  return false;
+}
+function voiceLeaveSocket(ws) {
+  const key = ws._voiceKey;
+  if (!key) return;
+  const sid = ws._voiceSid;
+  if (sid) voiceSockets.delete(sid);
+  const room = voiceRooms.get(key);
+  if (room) {
+    room.delete(sid);
+    if (!room.size) voiceRooms.delete(key);
+  }
+  ws._voiceKey = null;
+  ws._voiceSid = null;
+  const parts = key.split(':');
+  voiceBroadcast(key, sid, {
+    type: 'voice-state', guildId: parts[0], channelId: parts[1],
+    state: 'peer-left', sid, peers: voicePeers(parts[0], parts[1])
+  });
+}
+
 // ---------- HTTP ----------
 function sendJSON(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store'
+  });
   res.end(body);
 }
 
@@ -134,6 +190,8 @@ const NICK_RE = /^[\p{L}\p{N}_]{2,20}$/u;
 function validNick(n) { return typeof n === 'string' && NICK_RE.test(n); }
 function validPass(p) { return typeof p === 'string' && p.length >= 4 && p.length <= 72; }
 function validPub(p) { return typeof p === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(p) && p.length >= 40 && p.length <= 120; }
+function validVault(v) { return typeof v === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(v) && v.length >= 80 && v.length <= 512; }
+function normNick(n) { return String(n || '').trim().toLowerCase(); }
 
 // ---------- API ----------
 async function handleApi(req, res, pathname) {
@@ -169,6 +227,28 @@ async function handleApi(req, res, pathname) {
     const body = await readBody(req);
     if (!validPub(body.pub)) return sendJSON(res, 400, { error: 'Неверный публичный ключ' });
     store.setPub(me, body.pub);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'GET' && u.pathname === '/api/me') {
+    const u2 = store.getUser(me) || {};
+    return sendJSON(res, 200, { nick: u2.name || me, pub: u2.pub || null, hasVault: !!store.getVault(me) });
+  }
+
+  // Хранилище ключа: сервер держит только конверт, зашифрованный паролем владельца.
+  if (method === 'GET' && u.pathname === '/api/vault') {
+    return sendJSON(res, 200, { vault: store.getVault(me) });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/vault') {
+    const body = await readBody(req);
+    if (!validVault(body.vault)) return sendJSON(res, 400, { error: 'Неверный конверт ключа' });
+    store.setVault(me, body.vault);
+    return sendJSON(res, 200, { ok: true, size: body.vault.length });
+  }
+
+  if (method === 'DELETE' && u.pathname === '/api/vault') {
+    store.setVault(me, null);
     return sendJSON(res, 200, { ok: true });
   }
 
@@ -261,6 +341,7 @@ async function handleApi(req, res, pathname) {
     if (store.friendStatus(me, to) !== 'accepted') return sendJSON(res, 403, { error: 'Нет доступа: вы не друзья' });
     if (typeof body.body !== 'string' || !body.body || body.body.length > 40000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.body))
       return sendJSON(res, 400, { error: 'Неверный шифротекст' });
+    store.syncFriendKeys(me, to); // держим pub собеседника свежим — иначе после смены ключа диалог «немеет»
     const rec = store.addMsg(me, to, body.body);
     sendTo(to, { type: 'msg', from: store.getUser(me).name, to, id: rec.id, ts: rec.ts, body: rec.body });
     return sendJSON(res, 200, { id: rec.id, ts: rec.ts });
@@ -282,10 +363,115 @@ async function handleApi(req, res, pathname) {
     return sendJSON(res, 200, { ok: true });
   }
 
+  // ---------- серверы (гильдии) ----------
+  if (method === 'GET' && u.pathname === '/api/guilds') {
+    const list = store.guildOfMember(me);
+    const out = list.map(g => ({
+      id: g.id, name: g.name, owner: g.owner, code: g.code,
+      channels: g.channels,
+      members: g.members.map(nick => ({ nick, pub: store.getUser(nick) ? store.getUser(nick).pub : null }))
+    }));
+    return sendJSON(res, 200, { guilds: out });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/guild') {
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    const g = store.createGuild(me, name);
+    return sendJSON(res, 200, { guild: { id: g.id, name: g.name, owner: g.owner, code: g.code, channels: g.channels } });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/guild/join') {
+    const body = await readBody(req);
+    const g = store.guildByCode(body.code);
+    if (!g) return sendJSON(res, 404, { error: 'Сервер по коду не найден' });
+    const joined = store.joinGuild(g, me);
+    return sendJSON(res, 200, { guild: { id: g.id, name: g.name, owner: g.owner, code: g.code, channels: g.channels }, joined });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/guild/leave') {
+    const body = await readBody(req);
+    const g = store.getGuild(String(body.guildId || ''));
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    store.leaveGuild(g, me);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'DELETE' && u.pathname === '/api/guild') {
+    const body = await readBody(req);
+    const g = store.getGuild(String(body.guildId || ''));
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    if (normNick(g.owner) !== normNick(me)) return sendJSON(res, 403, { error: 'Удалять может только владелец' });
+    store.deleteGuild(g.id);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/guild/channel') {
+    const body = await readBody(req);
+    const g = store.getGuild(String(body.guildId || ''));
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    if (!g.members.includes(normNick(me))) return sendJSON(res, 403, { error: 'Вы не участник сервера' });
+    if (normNick(g.owner) !== normNick(me)) return sendJSON(res, 403, { error: 'Каналы создаёт владелец' });
+    const ch = store.addChannel(g, body.kind, body.name);
+    return sendJSON(res, 200, { channel: ch });
+  }
+
+  if (method === 'DELETE' && u.pathname === '/api/guild/channel') {
+    const body = await readBody(req);
+    const g = store.getGuild(String(body.guildId || ''));
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    if (normNick(g.owner) !== normNick(me)) return sendJSON(res, 403, { error: 'Каналы удаляет владелец' });
+    store.removeChannel(g, String(body.channelId || ''));
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && u.pathname === '/api/guild/msg') {
+    const body = await readBody(req);
+    const g = store.getGuild(String(body.guildId || ''));
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    if (!g.members.includes(normNick(me))) return sendJSON(res, 403, { error: 'Вы не участник сервера' });
+    const ch = g.channels.find(c => c.id === String(body.channelId || ''));
+    if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
+    if (ch.kind !== 'text') return sendJSON(res, 400, { error: 'В голосовом канале пишут' });
+    const env = body.body;
+    if (!env || typeof env !== 'object') return sendJSON(res, 400, { error: 'Неверный конверт' });
+    const keys = Object.keys(env);
+    if (!keys.length || keys.length > 50) return sendJSON(res, 400, { error: 'Пусто или слишком много получателей' });
+    for (const k of keys) {
+      if (!g.members.includes(k)) return sendJSON(res, 400, { error: 'Получатель не участник сервера' });
+      const v = env[k];
+      if (typeof v !== 'string' || !v || v.length > 40000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(v))
+        return sendJSON(res, 400, { error: 'Неверный шифротекст' });
+    }
+    const rec = store.addGuildMsg(g.id, ch.id, me, env);
+    for (const m of g.members) {
+      if (normNick(m) === normNick(me)) continue;
+      sendTo(m, { type: 'guild-msg', guildId: g.id, channelId: ch.id, id: rec.id, from: store.getUser(me).name, ts: rec.ts });
+    }
+    return sendJSON(res, 200, { id: rec.id, ts: rec.ts });
+  }
+
+  const gconvM = /^\/api\/guild\/conv\/([A-Za-z0-9_%]+)\/([A-Za-z0-9_%]+)$/.exec(u.pathname);
+  if (method === 'GET' && gconvM) {
+    const guildId = decodeURIComponent(gconvM[1]);
+    const channelId = decodeURIComponent(gconvM[2]);
+    const g = store.getGuild(guildId);
+    if (!g) return sendJSON(res, 404, { error: 'Сервер не найден' });
+    if (!g.members.includes(normNick(me))) return sendJSON(res, 403, { error: 'Вы не участник сервера' });
+    const ch = g.channels.find(c => c.id === channelId);
+    if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
+    const after = u.searchParams.get('after') ? parseInt(u.searchParams.get('after'), 10) : 0;
+    const msgs = store.getGuildMsgs(guildId, channelId, me, after || 0);
+    return sendJSON(res, 200, { msgs });
+  }
+
   return sendJSON(res, 404, { error: 'Не найдено' });
 }
 
 // ---------- статика ----------
+// HTML отдаём с no-store: оболочка не должна закешироваться, иначе браузер долго
+// грузит старый app.js (а версия ассетов задаётся в index.html через ?v=).
+// Сами ассеты можно кешировать надолго — их адрес меняется вместе с версией.
 function serveStatic(req, res, pathname) {
   let p = pathname === '/' ? '/index.html' : pathname;
   p = path.normalize(path.join(ROOT, p));
@@ -293,7 +479,15 @@ function serveStatic(req, res, pathname) {
   fs.readFile(p, (err, buf) => {
     if (err) return sendJSON(res, 404, { error: 'Not found' });
     const ext = path.extname(p).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': buf.length });
+    const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': buf.length };
+    if (ext === '.html' || ext === '') {
+      headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0';
+      headers['Pragma'] = 'no-cache';
+      headers['Expires'] = '0';
+    } else {
+      headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+    }
+    res.writeHead(200, headers);
     res.end(buf);
   });
 }
@@ -322,6 +516,51 @@ wss.on('connection', (ws, req) => {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'typing' && msg.to) {
         sendTo(msg.to, { type: 'typing', nick });
+      } else if (msg.type === 'voice-signal') {
+        // ретрансляция WebRTC-сигнала конкретному sid (соединению) в звонке
+        const to = String(msg.to || '');
+        if (to) voiceSendSid(to, { type: 'voice-signal', from: ws._voiceSid, signal: msg.signal });
+      } else if (msg.type === 'voice') {
+        const g = store.getGuild(String(msg.guildId || ''));
+        if (!g) return;
+        const ch = g.channels.find(c => c.id === String(msg.channelId || ''));
+        if (!ch || ch.kind !== 'voice') return;
+        if (!g.members.includes(normNick(nick))) return;
+        const key = voiceRoomKey(g.id, ch.id);
+        if (msg.action === 'join') {
+          let room = voiceRooms.get(key);
+          if (!room) { room = new Map(); voiceRooms.set(key, room); }
+          const sid = 'v' + (voiceSeq++) + '_' + Date.now().toString(36);
+          room.set(sid, normNick(nick));
+          voiceSockets.set(sid, ws);
+          ws._voiceKey = key;
+          ws._voiceSid = sid;
+          ws.send(JSON.stringify({
+            type: 'voice-state', guildId: g.id, channelId: ch.id,
+            state: 'joined', sid, peers: voicePeers(g.id, ch.id)
+          }));
+          voiceBroadcast(key, sid, {
+            type: 'voice-state', guildId: g.id, channelId: ch.id,
+            state: 'peer-joined', nick: normNick(nick), sid, peers: voicePeers(g.id, ch.id)
+          });
+        } else if (msg.action === 'leave') {
+          const room = voiceRooms.get(key);
+          const sid = ws._voiceSid;
+          if (room) {
+            room.delete(sid);
+            if (!room.size) voiceRooms.delete(key);
+          }
+          voiceSockets.delete(sid);
+          ws._voiceKey = null;
+          ws._voiceSid = null;
+          voiceBroadcast(key, sid, {
+            type: 'voice-state', guildId: g.id, channelId: ch.id,
+            state: 'peer-left', sid, peers: voicePeers(g.id, ch.id)
+          });
+          ws.send(JSON.stringify({
+            type: 'voice-state', guildId: g.id, channelId: ch.id, state: 'left'
+          }));
+        }
       }
     } catch (e) { /* ignore */ }
   });
@@ -329,6 +568,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     onlineRemove(nick, ws);
     if (onlineCount(nick) === 0) broadcastPresence(nick, false);
+    voiceLeaveSocket(ws);
   });
 });
 

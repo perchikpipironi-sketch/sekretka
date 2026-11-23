@@ -240,6 +240,7 @@ input:focus-visible, textarea:focus-visible, button:focus-visible { outline: 2px
 .feat b { color: var(--txt); font-weight: 600; }
 
 .auth-err { background: rgba(255, 77, 141, .12); border: 1px solid rgba(255, 77, 141, .38); color: #ffb3c9; border-radius: 11px; padding: 10px 13px; font-size: 13px; margin-top: 12px; display: none; }
+.auth-note { margin-top: 12px; font-size: 12px; line-height: 1.5; color: var(--mut); }
 .auth-ver { text-align: center; color: var(--mut); font-size: 12px; margin-top: 16px; opacity: .65; }
 
 /* ============ главный лэйаут: рейл | чаты | переписка | детали ============ */
@@ -787,3 +788,36 @@ input:focus-visible, textarea:focus-visible, button:focus-visible { outline: 2px
   .composer-logo { display: none; }
   .rec-round { width: 44px; }
 }
+/* ---------- серверы (гильдии) ---------- */
+.gpanel { display:flex; flex-direction:column; gap:6px; padding:10px 8px; overflow-y:auto; min-height:0; }
+.g-item { display:flex; flex-direction:column; gap:2px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
+.g-item.on { border-color:var(--acc1); box-shadow:0 0 0 1px color-mix(in srgb, var(--acc1) 35%, transparent); }
+.g-name { display:flex; flex-direction:column; align-items:flex-start; gap:2px; width:100%; background:none; border:none; color:var(--txt); font:inherit; cursor:pointer; text-align:left; }
+.g-name:hover .g-sub { color:var(--mut); }
+.g-sub { font-size:11px; color:var(--mut); }
+.g-badge { align-self:flex-end; min-width:18px; height:18px; border-radius:9px; background:var(--acc1); color:var(--bg0); font-size:11px; font-weight:700; display:grid; place-items:center; padding:0 5px; }
+.g-badge:empty { display:none; }
+.g-ch { display:flex; align-items:center; gap:6px; width:100%; padding:5px 8px; border-radius:8px; background:none; border:none; color:var(--txt); font:inherit; cursor:pointer; margin-top:2px; text-align:left; }
+.g-ch:hover { background:var(--glass); }
+.g-ch.on { background:color-mix(in srgb, var(--acc1) 22%, transparent); }
+.g-ico { opacity:.75; width:18px; text-align:center; flex:0 0 18px; }
+.g-chadd { display:flex; gap:6px; margin-top:4px; }
+.g-action { display:inline-flex; align-items:center; justify-content:center; background:color-mix(in srgb, var(--acc1) 20%, transparent); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; line-height:1.2; }
+.g-action:hover { background:var(--acc1); color:var(--bg0); }
+.g-action.ghost { background:none; border-style:dashed; }
+.g-avatar { font-size:24px; }
+/* ---------- звонки (голосовые каналы) ---------- */
+.call-panel { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; height:100%; padding:20px; text-align:center; }
+.call-status { font-size:16px; font-weight:600; color:var(--txt); }
+.call-wait-timer { font-family:ui-monospace,Consolas,monospace; font-size:38px; font-weight:700; color:var(--acc1); text-shadow:0 0 24px var(--glow1); letter-spacing:2px; }
+.call-videos { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; max-width:100%; }
+.call-video { position:relative; width:150px; height:188px; background:var(--panel); border:1px solid var(--line); border-radius:16px; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; }
+.call-video video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+.call-video .call-avatar { pointer-events:none; }
+.call-name { position:relative; z-index:1; font-size:12px; color:var(--txt); background:color-mix(in srgb, var(--bg0) 72%, transparent); border-radius:8px; padding:2px 8px; }
+.call-controls { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+.call-btn { width:48px; height:48px; border-radius:50%; border:1px solid var(--line); background:var(--panel); color:var(--txt); font-size:20px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; transition:transform .15s ease, box-shadow .15s ease, background .15s ease; }
+.call-btn:hover { transform:translateY(-2px); box-shadow:0 4px 18px var(--glow1); }
+.call-btn.on { background:var(--grad); color:var(--bg0); border-color:transparent; box-shadow:0 0 18px var(--glow1); }
+#callLeave { border-color:rgba(244,63,94,.55); color:#ffb9c6; }
+#callLeave:hover { background:rgba(244,63,94,.22); box-shadow:0 0 18px rgba(244,63,94,.35); }

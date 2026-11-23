@@ -134,10 +134,50 @@
     }).catch(function () { return null; });
   }
 
+  // --- хранилище ключа в аккаунте: секрет заворачивается паролем (PBKDF2-SHA256 + AES-GCM) ---
+  // Сервер получает только конверт. Пароль нигде не сохраняется — он живёт в памяти до перезагрузки страницы.
+  var PBKDF2_ITER = 210000;
+  var VAULT_AAD = 'sekretka-vault-1';
+
+  function pbkdf2Key(pass, salt, usage) {
+    return crypto.subtle.importKey('raw', enc.encode(String(pass)), { name: 'PBKDF2' }, false, ['deriveKey'])
+      .then(function (base) {
+        return crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: salt, iterations: PBKDF2_ITER, hash: 'SHA-256' },
+          base, { name: 'AES-GCM', length: 256 }, false, usage
+        );
+      });
+  }
+
+  // secretB64 (отмычка) + пароль -> конверт b64(salt16||iv12||ct)
+  function wrapSecret(secretB64, pass) {
+    var salt = randomBytes(16), iv = randomBytes(12);
+    return pbkdf2Key(pass, salt, ['encrypt']).then(function (key) {
+      return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, additionalData: enc.encode(VAULT_AAD) }, key, enc.encode(secretB64));
+    }).then(function (ct) {
+      return b64(concatBytes([salt, iv, new Uint8Array(ct)]));
+    });
+  }
+
+  // конверт + пароль -> secretB64 или null (неверный пароль / порча / чужое хранилище)
+  function unwrapSecret(vaultB64, pass) {
+    return Promise.resolve().then(function () {
+      var raw = unb64(vaultB64);
+      if (!raw || raw.length < 28) return null;
+      var salt = raw.subarray(0, 16), iv = raw.subarray(16, 28), ct = raw.subarray(28);
+      if (ct.length < 16) return null;
+      return pbkdf2Key(pass, salt, ['decrypt']).then(function (key) {
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv, additionalData: enc.encode(VAULT_AAD) }, key, ct);
+      }).then(function (pt) { return dec.decode(pt); });
+    }).catch(function () { return null; });
+  }
+
   return {
     randomBytes: randomBytes,
     b64: b64,
     unb64: unb64,
+    wrapSecret: wrapSecret,
+    unwrapSecret: unwrapSecret,
     generateKeypair: generateKeypair,
     keypairFromSecret: keypairFromSecret,
     exportSecret: exportSecret,

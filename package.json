@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "demo": "set DEMO=1&& node server.js",
-    "test:crypto": "node test/crypto.test.js"
+    "test:crypto": "node test/crypto.test.js",
+    "test:vault": "node test/vault.test.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {

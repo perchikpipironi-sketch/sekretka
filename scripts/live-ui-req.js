@@ -120,15 +120,22 @@ async function makeUser(nick) {
     ws: (typeof state !== 'undefined' && state.ws) ? state.ws.readyState : null
   };`;
 
-  await send('Page.navigate', { url: `${BASE}/?t=${ALICE}|pass1234` });
-  let ready = null;
+  // v21: аккаунт без ключа теперь честно просит ключ, поэтому «первое устройство»
+  // создаём через &fresh=1 и закрываем окно бэкапа, чтобы попасть в интерфейс.
+  await send('Page.navigate', { url: `${BASE}/?t=${ALICE}|pass1234&fresh=1` });
+  let ready = null, clickedBackup = false;
   for (let i = 0; i < 60; i++) {
     ready = await evaluate(`return {
       rail: !!document.querySelector('#railRequests'),
+      backup: !!document.querySelector('#backupDone'),
       badge: (document.querySelector('#requestsBadge')||{}).textContent || null,
       ws: (typeof state !== 'undefined' && state.ws) ? state.ws.readyState : null,
       me: (typeof state !== 'undefined') ? state.me : null
     };`);
+    if (!clickedBackup && ready && ready.backup) {
+      await evaluate(`document.querySelector('#backupDone').click(); return true;`);
+      clickedBackup = true;
+    }
     if (ready.rail && ready.ws === 1) break;
     await sleep(300);
   }

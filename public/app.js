@@ -2,7 +2,7 @@
 /* Секретка — клиент. Вся криптография — здесь, в браузере. */
 
 const LS = { nick: 'sk_nick', token: 'sk_token', kp: 'sk_kp', theme: 'sk_theme' };
-const APP_VERSION = '20';
+const APP_VERSION = '26';
 
 const state = {
   me: null, token: null, kp: null,
@@ -10,6 +10,7 @@ const state = {
   conv: null, convPub: null, shared: null,
   msgs: [], unread: {}, typing: {}, typingTimers: {},
   lastTs: 0,
+  guilds: [], gview: null, view: 'dm',
   ws: null, wsTry: 0, dec: 0
 };
 
@@ -124,16 +125,95 @@ async function api(method, p, body, token) {
 const apiToken = (tok, method, p, body) => api(method, p, body, tok);
 
 // ---------- локальные ключи ----------
-function makeKp() {
+// Ключ хранится отдельно для каждого аккаунта: на одном браузере можно держать
+// несколько разных личностей, не перетирая друг другу отмычки.
+function keySlot(nick) { return 'sk_kp_' + String(nick || '').toLowerCase(); }
+function kpNick(nick) { return nick || state.me || localStorage.getItem(LS.nick); }
+
+function makeKp(nick) {
   const kp = window.SecCrypto.generateKeypair();
-  localStorage.setItem(LS.kp, window.SecCrypto.exportSecret(kp));
+  saveKp(kp, nick);
   return kp;
 }
-function loadKp() {
-  const s = localStorage.getItem(LS.kp);
+function loadKp(nick) {
+  const n = kpNick(nick);
+  let s = n ? localStorage.getItem(keySlot(n)) : null;
+  if (!s) {
+    // миграция со старых сборок: глобальный ключ принадлежит тому аккаунту,
+    // который последним входил (LS.nick), — чужой ключ другому аккаунту не отдаём
+    const legacyNick = kpNick(localStorage.getItem(LS.nick));
+    if (!n || !legacyNick || legacyNick === n) s = localStorage.getItem(LS.kp);
+  }
   return s ? window.SecCrypto.keypairFromSecret(s) : null;
 }
-function saveKp(kp) { localStorage.setItem(LS.kp, window.SecCrypto.exportSecret(kp)); }
+function saveKp(kp, nick) {
+  const s = window.SecCrypto.exportSecret(kp);
+  const n = kpNick(nick);
+  if (n) localStorage.setItem(keySlot(n), s);
+  localStorage.setItem(LS.kp, s); // совместимость со старыми сборками
+  return s;
+}
+function dropKp(nick) {
+  const n = kpNick(nick);
+  if (n) localStorage.removeItem(keySlot(n));
+  localStorage.removeItem(LS.kp);
+}
+
+// ---------- хранилище ключа в аккаунте ----------
+// Секретный ключ заворачивается паролем (PBKDF2 210k + AES-GCM) и уезжает на сервер
+// конвертом: сервер не может его открыть, а новое устройство после входа по паролю
+// получает историю расшифрованной. Пароль живёт только в памяти вкладки.
+async function vaultSave(pass, kp) {
+  const key = kp || state.kp;
+  if (!pass || !key) return false;
+  try {
+    const vault = await window.SecCrypto.wrapSecret(window.SecCrypto.exportSecret(key), pass);
+    await api('POST', '/api/vault', { vault });
+    return true;
+  } catch (e) { return false; }
+}
+
+async function vaultRestore(pass) {
+  if (!pass) return null;
+  let vault = null;
+  try { vault = (await api('GET', '/api/vault')).vault; } catch (e) { return null; }
+  if (!vault) return null;
+  const secret = await window.SecCrypto.unwrapSecret(vault, pass);
+  if (!secret) return null;
+  try { return window.SecCrypto.keypairFromSecret(secret); } catch (e) { return null; }
+}
+
+// Подбирает ключ под аккаунт: свой локальный -> из хранилища на сервере -> спросить человека.
+// Никогда не создаёт новый ключ молча: иначе старое устройство перестанет читать переписку.
+async function resolveKeyForAccount(pass) {
+  let pub = null;
+  try { pub = (await api('GET', '/api/me')).pub; } catch (e) { /* не критично */ }
+  const local = loadKp(state.me);
+  if (local && (!pub || window.SecCrypto.publicB64(local) === pub)) return { kp: local, from: 'local', pub };
+  const fromVault = await vaultRestore(pass);
+  if (fromVault) { saveKp(fromVault); return { kp: fromVault, from: 'vault', pub }; }
+  return { kp: null, from: local ? 'conflict' : 'missing', pub };
+}
+
+// Приводим публичный ключ в аккаунте в согласие с локальным. Чужой ключ НЕ перетираем:
+// если в аккаунте уже лежит другой pub (ключ сменили на другом устройстве) — отдаём false.
+// Заодно запоминаем, есть ли в аккаунте конверт ключа (нужно initMain, чтобы предложить бэкап).
+let lastHasVault = false;
+async function syncPub() {
+  const localPub = window.SecCrypto.publicB64(state.kp);
+  let serverPub = null;
+  lastHasVault = false;
+  try {
+    const me = await api('GET', '/api/me');
+    serverPub = me.pub;
+    lastHasVault = !!me.hasVault;
+  } catch (e) { /* не критично */ }
+  if (!serverPub) {
+    try { await api('PUT', '/api/me', { pub: localPub }); } catch (e) { /* не критично */ }
+    return true;
+  }
+  return serverPub === localPub;
+}
 
 function convKey(a, b) { return [a, b].sort().join('|'); }
 
@@ -187,6 +267,7 @@ function renderAuth() {
     ),
     h('button', { class: 'btn-primary', id: 'authGo', type: 'button' }, 'Войти'),
     h('div', { class: 'auth-err', id: 'authErr' }),
+    h('div', { class: 'auth-note' }, '🔑 Ключ шифрования лежит в аккаунте зашифрованным твоим паролем — на новом телефоне войди тем же именем и паролем, и история откроется сама.'),
     h('div', { class: 'feats' },
       h('div', { class: 'feat' }, h('span', {}, '🔒'), h('span', {}, h('b', {}, 'Сквозное шифрование'), ' — X25519 + AES-GCM, ключи живут только у вас')),
       h('div', { class: 'feat' }, h('span', {}, '🕶️'), h('span', {}, 'Сервер хранит только шифротекст — даже он не прочитает переписку')),
@@ -220,19 +301,26 @@ function renderAuth() {
     try {
       const ep = mode === 'login' ? '/api/login' : '/api/register';
       const r = await api('POST', ep, { nick, pass });
-      state.me = r.nick; state.token = r.token;
+      state.me = r.nick; state.token = r.token; state.pass = pass;
       localStorage.setItem(LS.nick, state.me);
       localStorage.setItem(LS.token, state.token);
 
-      const kp = loadKp();
-      if (kp) {
-        state.kp = kp;
+      const res = await resolveKeyForAccount(pass);
+      if (res.kp) {
+        state.kp = res.kp;
+        if (res.from === 'vault') toast('Ключ подтянут из аккаунта 🔑');
         await initMain();
-      } else {
-        // первое устройство: создаём ключ и предлагаем бэкап
-        state.kp = makeKp();
-        showKeyModal('new');
+        vaultSave(pass); // держим конверт свежим
+        return;
       }
+      if (mode === 'reg' && !res.pub) {
+        // новое устройство и новый аккаунт: создаём ключ и сразу кладём конверт в аккаунт
+        state.kp = makeKp();
+        await vaultSave(pass);
+        showKeyModal('new');
+        return;
+      }
+      showKeyModal('enter', { reason: res.from, pass });
     } catch (e) {
       errBox.textContent = e.message;
       errBox.style.display = 'block';
@@ -271,18 +359,20 @@ function fallbackCopy(text, done) {
   ta.remove();
 }
 
-function showKeyModal(kind) {
+function showKeyModal(kind, opts) {
+  opts = opts || {};
   const modal = h('div', { class: 'modal' });
   if (kind === 'new') {
     const secret = window.SecCrypto.exportSecret(state.kp);
     modal.append(
       h('h3', {}, 'Твой секретный ключ 🔑'),
-      h('p', {}, 'Это «отмычка» к твоим сообщениям. Без неё новое устройство не сможет расшифровать переписку. Сохрани её в заметках — только ты и никто другой.'),
+      h('p', {}, 'Это «отмычка» к твоим сообщениям. Она уже сохранена в аккаунте зашифрованной паролем — на другом устройстве достаточно войти с тем же именем и паролем. Но сохрани её и вручную: если забудешь пароль, только она вернёт доступ к переписке.'),
       h('div', { class: 'key-box', id: 'backupBox' }, secret),
       h('div', { class: 'modal-actions' },
         h('button', { class: 'btn-primary', id: 'copyKey', type: 'button' }, '📋 Скопировать'),
         h('button', { class: 'btn-ghost', id: 'backupDone', type: 'button' }, 'Я сохранил(а)')
       ),
+      h('button', { class: 'btn-link', id: 'keyRestoreLink', type: 'button' }, 'Вставить отмычку с другого устройства'),
       h('button', { class: 'btn-link', id: 'backupSkip', type: 'button' }, 'Пропустить — войти без бэкапа')
     );
     modal.querySelector('#copyKey').addEventListener('click', () => {
@@ -293,26 +383,43 @@ function showKeyModal(kind) {
     });
     modal.querySelector('#backupDone').addEventListener('click', () => { closeModal(); initMain(); });
     modal.querySelector('#backupSkip').addEventListener('click', () => { closeModal(); initMain(); });
+    modal.querySelector('#keyRestoreLink').addEventListener('click', () => { closeModal(); showKeyModal('enter', { reason: 'manual', pass: state.pass }); });
   } else if (kind === 'enter') {
+    const reason = opts.reason || 'missing';
+    const intro = reason === 'conflict'
+      ? 'На этом устройстве лежит ключ от другого аккаунта. Вставь отмычку от этого аккаунта — или создай новый ключ (тогда старая переписка станет недоступной):'
+      : 'На этом устройстве ещё нет ключа от этого аккаунта, и в самом аккаунте он не сохранён. Возьми отмычку на старом устройстве (кнопка «Ключ» слева) и вставь сюда — или создай новый ключ (старая переписка станет недоступной):';
     modal.append(
-      h('h3', {}, 'Восстановить ключ?'),
-      h('p', {}, 'На этом устройстве ещё нет твоего секретного ключа. Вставь его из бэкапа, чтобы читать старые сообщения, или создай новый (старая переписка станет недоступной):'),
+      h('h3', {}, 'Ключ от этого аккаунта'),
+      h('p', {}, intro),
       h('textarea', { id: 'restoreBox', placeholder: 'Вставь секретный ключ (base64)…' }),
       h('div', { class: 'modal-actions' },
         h('button', { class: 'btn-primary', id: 'restoreGo', type: 'button' }, 'Восстановить'),
         h('button', { class: 'btn-ghost', id: 'restoreNew', type: 'button' }, 'Создать новый')
-      )
+      ),
+      opts.pass ? h('button', { class: 'btn-link', id: 'restoreRetry', type: 'button' }, 'Попробовать снова с паролем') : null
     );
-    modal.querySelector('#restoreGo').addEventListener('click', () => {
+    modal.querySelector('#restoreGo').addEventListener('click', async () => {
       try {
         const kp = window.SecCrypto.keypairFromSecret($('#restoreBox').value.trim());
         saveKp(kp); state.kp = kp;
+        if (state.pass) vaultSave(state.pass, kp);
         closeModal(); initMain();
       } catch (e) { toast('Не похоже на ключ 🤔', 'err'); }
     });
-    modal.querySelector('#restoreNew').addEventListener('click', () => {
-      state.kp = makeKp(); closeModal(); showKeyModal('new');
+    modal.querySelector('#restoreNew').addEventListener('click', async () => {
+      if (!window.confirm('Создать новый ключ? Переписка, зашифрованная старым ключом, останется недоступной.')) return;
+      state.kp = makeKp();
+      if (state.pass) await vaultSave(state.pass);
+      closeModal(); showKeyModal('new');
     });
+    if (opts.pass) {
+      modal.querySelector('#restoreRetry').addEventListener('click', async () => {
+        const kp = await vaultRestore(opts.pass);
+        if (kp) { saveKp(kp); state.kp = kp; closeModal(); initMain(); toast('Ключ подтянут из аккаунта 🔑'); }
+        else toast('В аккаунте нет сохранённого ключа', 'err');
+      });
+    }
   }
   attachOverlay(modal);
 }
@@ -323,10 +430,62 @@ function avatarColor(nick) {
   return `linear-gradient(135deg, hsl(${hue} 70% 52%), hsl(${(hue + 40) % 360} 70% 42%))`;
 }
 
+// Окно «сохранить ключ в аккаунт»: сессия восстановлена по токену (пароля в памяти нет),
+// а конверта в аккаунте ещё нет — значит история не откроется на другом устройстве.
+function showVaultSaveModal() {
+  if (document.querySelector('#vaultSaveModal')) return;
+  const modal = h('div', { class: 'modal', id: 'vaultSaveModal' });
+  const passIn = h('input', { id: 'vaultPass', type: 'password', placeholder: '••••••••', maxlength: '72', autocomplete: 'current-password' });
+  const err = h('div', { class: 'auth-err', id: 'vaultErr' });
+  const go = h('button', { class: 'btn-primary', id: 'vaultSaveGo', type: 'button' }, 'Сохранить ключ');
+  const later = h('button', { class: 'btn-ghost', id: 'vaultSaveLater', type: 'button' }, 'Позже');
+  modal.append(
+    h('h3', {}, 'Сохранить ключ в аккаунт 🔑'),
+    h('p', {}, 'Чтобы история открывалась на телефоне, один раз подтверди пароль от аккаунта — ключ ляжет в аккаунт зашифрованным паролем, и сервер его не прочитает.'),
+    h('div', { class: 'field' }, h('label', {}, 'Пароль'), passIn),
+    err,
+    h('div', { class: 'modal-actions' }, go, later)
+  );
+
+  const submit = async () => {
+    const pw = passIn.value.trim();
+    if (pw.length < 4) { err.textContent = 'Пароль слишком короткий'; err.style.display = 'block'; return; }
+    go.disabled = true; go.textContent = 'Сохраняю…';
+    try {
+      const r = await api('POST', '/api/login', { nick: state.me, pass: pw });
+      state.token = r.token;
+      localStorage.setItem(LS.token, r.token);
+      state.pass = pw;
+      await vaultSave(pw);
+      closeModal();
+      toast('Ключ сохранён в аккаунт — история откроется на другом устройстве 🔑');
+    } catch (e) {
+      err.textContent = e.status === 400 || e.status === 401 ? 'Пароль не подошёл' : e.message;
+      err.style.display = 'block';
+      go.disabled = false; go.textContent = 'Сохранить ключ';
+    }
+  };
+
+  attachOverlay(modal);
+  go.addEventListener('click', submit);
+  passIn.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  later.addEventListener('click', closeModal);
+  setTimeout(() => { try { passIn.focus(); } catch (e) { /* ignore */ } }, 120);
+}
+
 async function initMain() {
-  if (!state.kp) state.kp = loadKp() || makeKp();
-  try { await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) }); }
-  catch (e) { /* не критично */ }
+  if (!state.kp) state.kp = loadKp();
+  if (!state.kp) { showKeyModal('enter', { reason: 'missing', pass: state.pass }); return; }
+  if (!(await syncPub())) {
+    // локальный ключ не от этого аккаунта — не подменяем ключ в аккаунте молча
+    showKeyModal('enter', { reason: 'conflict', pass: state.pass });
+    return;
+  }
+  // аккаунт без конверта: сохраним ключ, если знаем пароль, иначе предложим сохранить
+  if (!lastHasVault) {
+    if (state.pass) { vaultSave(state.pass); }
+    else { setTimeout(() => showVaultSaveModal(), 500); }
+  }
   renderMain();
   connectWS();
   startPoll();
@@ -363,6 +522,11 @@ function renderMain() {
   const rail = h('div', { class: 'rail' },
     h('div', { class: 'rail-brand', title: 'Секретка' }, '🔐'),
     h('div', { class: 'rail-nav' },
+      h('button', { class: 'rail-btn on', id: 'railDm', type: 'button', title: 'Личные сообщения' },
+        h('span', { class: 'ri' }, '💬'), h('span', { class: 'rl' }, 'Чаты'),
+        h('span', { class: 'badge', id: 'dmBadge' })),
+      h('button', { class: 'rail-btn', id: 'railGuilds', type: 'button', title: 'Серверы (каналы)' },
+        h('span', { class: 'ri' }, '🏰'), h('span', { class: 'rl' }, 'Серверы')),
       h('button', { class: 'rail-btn', id: 'railRequests', type: 'button', title: 'Заявки в друзья' },
         h('span', { class: 'ri' }, '💌'), h('span', { class: 'rl' }, 'Заявки'),
         h('span', { class: 'badge', id: 'requestsBadge' })),
@@ -379,21 +543,7 @@ function renderMain() {
     )
   );
 
-  const side = h('div', { class: 'side' });
-  side.append(
-    h('div', { class: 'side-head' },
-      h('div', { class: 'mini-brand' },
-        h('span', {}, 'Чаты'),
-        h('span', { class: 'side-count', id: 'sideCount' }),
-        h('button', { class: 'side-close', id: 'sideClose', type: 'button', title: 'Закрыть' }, '✕')
-      ),
-      h('div', { class: 'add-row' },
-        h('input', { id: 'addNick', placeholder: 'Имя друга…', maxlength: '20' }),
-        h('button', { id: 'addGo', type: 'button' }, '+')
-      )
-    ),
-    h('div', { class: 'friend-list', id: 'friendList' })
-  );
+  const side = h('div', { class: 'side' }, h('div', { id: 'sideVbox' }));
 
   const chat = h('div', { class: 'chat' },
     h('div', { class: 'chat-head', id: 'chatHead' },
@@ -430,12 +580,17 @@ function renderMain() {
   const backdrop = h('div', { class: 'drawer-backdrop', id: 'drawerBackdrop' });
   app().replaceChildren(main, backdrop);
 
+  // рендер содержимого боковой панели по режиму (личка / серверы)
+  if (state.view === 'guild') renderGuildSide(); else renderDmSide();
+
+  $('#railDm').addEventListener('click', () => setView('dm'));
+  $('#railGuilds').addEventListener('click', () => setView('guild'));
   $('#addGo').addEventListener('click', addFriend);
   $('#addNick').addEventListener('keydown', e => { if (e.key === 'Enter') addFriend(); });
   $('#railRequests').addEventListener('click', () => {
     refreshRequests(false).then(() => renderRequests()).catch(() => renderRequests());
   });
-  $('#railKeys').addEventListener('click', () => showKeyModal('new'));
+  $('#railKeys').addEventListener('click', () => state.kp ? showKeyModal('new') : showKeyModal('enter', { reason: 'missing', pass: state.pass }));
   $('#railTheme').addEventListener('click', showThemeModal);
   $('#railExit').addEventListener('click', logout);
   $('#chatMenu').addEventListener('click', () => showChatMenu());
@@ -521,6 +676,684 @@ function nicksSig(list) {
   return (list || []).map(x => String(x.nick || '').toLowerCase()).sort().join(',');
 }
 
+// ---------- серверы (гильдии): как в Discord ----------
+function gAad(guildId, channelId) { return 'g:' + guildId + ':' + channelId; }
+function guildById(id) { return state.guilds.find(g => g.id === id) || null; }
+function guildUnread(g) {
+  if (!state.gview || state.gview.guildId !== g.id) return g.unread || 0;
+  return 0;
+}
+
+async function loadGuilds() {
+  const r = await api('GET', '/api/guilds');
+  state.guilds = r.guilds;
+  if (state.view === 'guild') renderGuildSide();
+  return r;
+}
+
+function setView(mode) {
+  if (!state.kp) return;
+  state.view = mode;
+  $('#railDm').classList.toggle('on', mode === 'dm');
+  $('#railGuilds').classList.toggle('on', mode === 'guild');
+  closeRightPanel();
+  if (mode === 'guild') {
+    state.conv = null; state.shared = null;
+    loadGuilds().then(() => {
+      renderGuildSide();
+      const g = state.guilds.find(x => x.channels && x.channels.length);
+      if (!state.gview) {
+        if (g) {
+          openGuildChannel(g, g.channels[0]);
+        } else {
+          const head = $('#chatHead');
+          if (head) {
+            head.replaceChildren(
+              h('button', { class: 'burger', id: 'chatBurger', type: 'button', title: 'Меню' }, '☰'),
+              h('div', { class: 'avatar g-avatar' }, '#'),
+              h('div', {}, h('div', { class: 'chat-title', id: 'chatTitle' }, 'Серверы'),
+                h('div', { class: 'chat-status', id: 'chatStatus' }, 'каналов пока нет')),
+              h('div', { class: 'spacer' }),
+              h('button', { class: 'menu-btn', id: 'chatMenu', type: 'button' }, '⋯')
+            );
+            $('#chatBurger').addEventListener('click', openDrawer);
+            $('#chatMenu').addEventListener('click', () => { if (state.guilds.length) gMenu(state.guilds[0]); });
+          }
+          const body = $('#chatBody');
+          if (body) body.replaceChildren(h('div', { class: 'empty-note' }, 'В серверах пока нет каналов — создай первый 🛠️'));
+        }
+      }
+    });
+  } else {
+    state.gview = null;
+    $('#chatHead').replaceChildren(
+      h('button', { class: 'burger', id: 'chatBurger', type: 'button', title: 'Меню' }, '☰'),
+      h('div', { class: 'avatar', id: 'chatAvatar' }),
+      h('div', {}, h('div', { class: 'chat-title', id: 'chatTitle' }), h('div', { class: 'chat-status', id: 'chatStatus' })),
+      h('div', { class: 'spacer' }),
+      h('button', { class: 'menu-btn', id: 'chatMenu', type: 'button' }, '⋯')
+    );
+    $('#chatBurger').addEventListener('click', openDrawer);
+    $('#chatMenu').addEventListener('click', showChatMenu);
+    $('#chatBody').replaceChildren(h('div', { class: 'empty-note' }, 'Выбери друга слева 💬'));
+    renderDmSide();
+  }
+}
+
+function renderDmSide() {
+  const box = $('#sideVbox');
+  if (!box) return;
+  const head = h('div', { class: 'side-head' },
+    h('div', { class: 'mini-brand' },
+      h('span', {}, 'Чаты'),
+      h('span', { class: 'side-count', id: 'sideCount' }),
+      h('button', { class: 'side-close', id: 'sideClose', type: 'button', title: 'Закрыть' }, '✕')
+    ),
+    h('div', { class: 'add-row' },
+      h('input', { id: 'addNick', placeholder: 'Имя друга…', maxlength: '20' }),
+      h('button', { id: 'addGo', type: 'button' }, '+')
+    )
+  );
+  const list = h('div', { class: 'friend-list', id: 'friendList' });
+  box.replaceChildren(head, list);
+  $('#sideClose').addEventListener('click', closeDrawer);
+  $('#addGo').addEventListener('click', addFriend);
+  $('#addNick').addEventListener('keydown', e => { if (e.key === 'Enter') addFriend(); });
+  renderFriends();
+}
+
+function renderGuildSide() {
+  const box = $('#sideVbox');
+  if (!box) return;
+  const isOwner = g => g.owner === String(state.me).toLowerCase();
+  const head = h('div', { class: 'side-head' },
+    h('div', { class: 'mini-brand' },
+      h('span', {}, 'Серверы'),
+      h('span', { class: 'side-count', id: 'sideCount' }, state.guilds.length),
+      h('button', { class: 'side-close', id: 'sideClose', type: 'button', title: 'Закрыть' }, '✕')
+    ),
+    h('div', { class: 'add-row' },
+      h('button', { class: 'g-action', id: 'gNew', type: 'button', title: 'Создать сервер' }, '+'),
+      h('button', { class: 'g-action', id: 'gJoin', type: 'button', title: 'Присоединиться по коду' }, '🔗')
+    )
+  );
+  const list = h('div', { class: 'gpanel', id: 'gList' });
+  if (!state.guilds.length) {
+    list.append(h('div', { class: 'empty-note' }, 'Серверов пока нет. Создай свой! 🏰'));
+  }
+  for (const g of state.guilds) {
+    const activeG = state.gview && state.gview.guildId === g.id;
+    const row = h('div', { class: 'g-item' + (activeG ? ' on' : '') },
+      h('button', { class: 'g-name', type: 'button' }, g.name,
+        h('span', { class: 'g-sub' }, g.members.length + ' участн. · #' + String(g.code).toUpperCase())),
+      h('span', { class: 'g-badge', id: 'gBadge_' + g.id })
+    );
+    if (activeG) {
+      for (const ch of g.channels) {
+        const activeCh = state.gview.channelId === ch.id;
+        const btn = h('button', { class: 'g-ch' + (activeCh ? ' on' : ''), type: 'button' },
+          h('span', { class: 'g-ico' }, ch.kind === 'voice' ? '🔊' : '#'),
+          h('span', {}, ch.name));
+        if (activeCh) btn.classList.add('on');
+        btn.addEventListener('click', () => openGuildChannel(g, ch));
+        row.append(btn);
+      }
+      if (isOwner(g)) {
+        const chRow = h('div', { class: 'g-chadd' },
+          h('button', { class: 'g-action', id: 'gAddCh_' + g.id, type: 'button' }, '+ канал'),
+          h('button', { class: 'g-action ghost', id: 'gDelCh_' + g.id, type: 'button' }, '─ канал'));
+        chRow.querySelector('#gAddCh_' + g.id).addEventListener('click', async () => {
+          const kind = confirm('Голосовой канал?') ? 'voice' : 'text';
+          const name = prompt('Название канала:', kind === 'text' ? 'общий' : 'голосовой');
+          if (name === null) return;
+          try { await api('POST', '/api/guild/channel', { guildId: g.id, kind, name }); await loadGuilds(); }
+          catch (e) { toast(e.message, 'err'); }
+        });
+        chRow.querySelector('#gDelCh_' + g.id).addEventListener('click', async () => {
+          const del = state.gview && state.gview.guildId === g.id ? document.querySelector('.g-ch.on') : null;
+          if (!del) { toast('Сначала выбери канал', 'err'); return; }
+          const chId = state.gview.channelId;
+          if (!confirm('Удалить канал?')) return;
+          try {
+            await api('DELETE', '/api/guild/channel', { guildId: g.id, channelId: chId });
+            state.gview = null;
+            await loadGuilds();
+            if (state.guilds.length) openGuildChannel(g, state.guilds.find(x => x.id === g.id).channels[0]);
+          } catch (e) { toast(e.message, 'err'); }
+        });
+        row.append(chRow);
+      }
+    }
+    row.querySelector('.g-name').addEventListener('click', () => {
+      if (activeG) return;
+      openGuildChannel(g, g.channels[0]);
+    });
+    row.querySelector('.g-name').addEventListener('contextmenu', e => {
+      e.preventDefault();
+      gMenu(g);
+    });
+    list.append(row);
+  }
+  box.replaceChildren(head, list);
+  $('#sideClose').addEventListener('click', closeDrawer);
+  $('#gNew').addEventListener('click', async () => {
+    const name = prompt('Название сервера:');
+    if (name === null) return;
+    try { await api('POST', '/api/guild', { name }); await loadGuilds(); }
+    catch (e) { toast(e.message, 'err'); }
+  });
+  $('#gJoin').addEventListener('click', async () => {
+    const code = prompt('Код приглашения (6 символов):');
+    if (!code) return;
+    try {
+      const r = await api('POST', '/api/guild/join', { code });
+      await loadGuilds();
+      toast('Ты в сервере «' + r.guild.name + '» 🎉');
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  updateGuildBadges();
+}
+
+function gMenu(g) {
+  const isOwner = g.owner === String(state.me).toLowerCase();
+  const modal = h('div', { class: 'modal' },
+    h('h3', {}, g.name),
+    h('p', {}, 'Код приглашения: ' + String(g.code).toUpperCase()),
+    h('button', { class: 'btn-primary', style: 'width:100%;margin-bottom:8px', type: 'button' }, 'Скопировать код'),
+    h('button', { class: 'btn-ghost', style: 'width:100%;margin-bottom:8px', type: 'button' }, 'Выйти из сервера'),
+    isOwner ? h('button', { class: 'btn-danger', style: 'width:100%', type: 'button' }, 'Удалить сервер') : null
+  );
+  const ov = attachOverlay(modal);
+  modal.querySelectorAll('button')[0].addEventListener('click', () => { fallbackCopy(String(g.code).toUpperCase()); toast('Код скопирован 🔗'); closeModal(ov); });
+  modal.querySelectorAll('button')[1].addEventListener('click', async () => {
+    try { await api('POST', '/api/guild/leave', { guildId: g.id }); state.gview = null; closeModal(ov); await loadGuilds(); }
+    catch (e) { toast(e.message, 'err'); }
+  });
+  if (isOwner) {
+    modal.querySelectorAll('button')[2].addEventListener('click', async () => {
+      if (!confirm('Удалить сервер навсегда?')) return;
+      try { await api('DELETE', '/api/guild', { guildId: g.id }); state.gview = null; closeModal(ov); await loadGuilds(); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+  }
+  document.body.append(ov);
+}
+
+function updateGuildBadges() {
+  for (const g of state.guilds) {
+    const b = $('#gBadge_' + g.id);
+    if (b) {
+      b.replaceChildren();
+      const n = guildUnread(g);
+      if (n) b.append(String(n));
+    }
+  }
+}
+
+async function openGuildChannel(guild, ch) {
+  if (!guild || !ch) return;
+  if (call && !(call.guildId === guild.id && call.channelId === ch.id)) closeCall(false);
+  state.gview = { guildId: guild.id, channelId: ch.id };
+  state.conv = null; state.shared = null; state.lastTs = 0;
+  state.msgs = [];
+  renderGuildSide();
+
+  const head = $('#chatHead');
+  if (head) {
+    head.replaceChildren(
+      h('button', { class: 'burger', id: 'chatBurger', type: 'button', title: 'Меню' }, '☰'),
+      h('div', { class: 'avatar g-avatar' }, ch.kind === 'voice' ? '🔊' : '#'),
+      h('div', {},
+        h('div', { class: 'chat-title', id: 'chatTitle' }, (ch.kind === 'voice' ? '🔊 ' : '# ') + ch.name),
+        h('div', { class: 'chat-status', id: 'chatStatus' }, guild.name + ' · ' + guild.members.length + ' участн.')
+      ),
+      h('div', { class: 'spacer' }),
+      h('button', { class: 'menu-btn', id: 'chatMenu', type: 'button' }, '⋯')
+    );
+    $('#chatBurger').addEventListener('click', openDrawer);
+    $('#chatMenu').addEventListener('click', () => gMenu(guild));
+  }
+
+  const body = $('#chatBody'), input = $('#msgInput');
+  body.replaceChildren(h('div', { class: 'empty-note' }, 'Загружаем историю…'));
+  if (input) input.placeholder = ch.kind === 'voice' ? 'В голосовом канале пишут…' : 'Сообщение в канал…';
+
+  if (ch.kind === 'voice') {
+    openVoiceCall(guild, ch);
+    return;
+  }
+
+  if (!guild.members.length || !guild.members.some(m => m.pub)) {
+    body.replaceChildren(h('div', { class: 'empty-note' }, 'Ещё нет участников с ключами — пригласи друзей по коду 🔗'));
+    return;
+  }
+
+  const aad = gAad(guild.id, ch.id);
+  try {
+    const r = await api('GET', '/api/guild/conv/' + encodeURIComponent(guild.id) + '/' + encodeURIComponent(ch.id) + '?after=0');
+    renderGuildMsgs(r.msgs, aad, false);
+    api('POST', '/api/seen', { nick: 'g:' + guild.id }).catch(() => {});
+  } catch (e) {
+    body.replaceChildren(h('div', { class: 'empty-note' }, 'Не удалось загрузить канал: ' + (e.message || e)));
+  }
+}
+
+// ---------- звонки (голосовые каналы, WebRTC P2P) ----------
+const CALL_WAIT_MS = 15 * 60 * 1000; // ждём собеседника до 15 минут
+let call = null; // { guildId, channelId, guild, ch, peers, pcMap, localStream, camStream, screenStream, micOn, camOn, screenOn, waitMs, waitTimer, closed }
+
+function wsMessage(obj) { if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj)); }
+
+function callControlBtn(id, text, title, on) {
+  return h('button', { class: 'call-btn' + (on ? ' on' : ''), id, type: 'button', title }, text);
+}
+function callVideoBox(nick, local) {
+  const box = h('div', { class: 'call-video' + (local ? ' local' : '') },
+    h('div', { class: 'call-avatar' }, avatarEl(nick, 56)),
+    h('video', { class: 'call-vid', autoplay: '1', playsinline: '1', muted: local ? '1' : '' }),
+    h('div', { class: 'call-name' }, local ? 'Ты' : nick)
+  );
+  return box;
+}
+
+function buildCallPanel(mode) {
+  const status = h('div', { class: 'call-status', id: 'callStatus' });
+  const timer = h('div', { class: 'call-wait-timer', id: 'callWaitTimer' });
+  const videos = h('div', { class: 'call-videos', id: 'callVideos' });
+  const controls = h('div', { class: 'call-controls' },
+    callControlBtn('callMic', '🎤', 'Микрофон', true),
+    callControlBtn('callCam', '📹', 'Камера', false),
+    callControlBtn('callScreen', '🖥', 'Экран', false),
+    callControlBtn('callLeave', '📞', 'Выйти из звонка', false)
+  );
+  if (mode === 'waiting') {
+    status.textContent = 'Ожидание собеседника…';
+    timer.textContent = fmtWait(15 * 60);
+  }
+  return h('div', { class: 'call-panel' }, status, timer, videos, controls);
+}
+
+function fmtWait(sec) {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+async function openVoiceCall(guild, ch) {
+  if (call && call.guildId === guild.id && call.channelId === ch.id) return;
+  closeCall(false);
+  const input = $('#chatInput');
+  if (input) input.style.display = 'none';
+  const body = $('#chatBody');
+  if (body) body.replaceChildren(buildCallPanel('waiting'));
+  call = {
+    guildId: guild.id, channelId: ch.id, guild, ch,
+    peers: new Map(), pcMap: new Map(), mySid: null,
+    localStream: null, camStream: null, screenStream: null,
+    micOn: true, camOn: false, screenOn: false,
+    waitMs: CALL_WAIT_MS, waitTimer: null, closed: false
+  };
+  $('.call-btn') && (() => {})();
+  document.getElementById('callMic').addEventListener('click', toggleMic);
+  document.getElementById('callCam').addEventListener('click', toggleCam);
+  document.getElementById('callScreen').addEventListener('click', toggleScreen);
+  document.getElementById('callLeave').addEventListener('click', () => leaveCall('Ты вышел из звонка'));
+  startWaitTimer();
+  // захват микрофона и вход в комнату
+  try {
+    call.localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    toast('Не удалось включить микрофон: ' + (e.message || e), 'err');
+  }
+  wsMessage({ type: 'voice', action: 'join', guildId: guild.id, channelId: ch.id });
+  if (new URLSearchParams(location.search).get('dbg') === '1') {
+    console.info('[voice] join sent', guild.id, ch.id, 'me=', state.me, 'ws=', state.ws ? state.ws.readyState : 'none');
+  }
+}
+
+function startWaitTimer() {
+  if (!call || call.waitTimer) return;
+  call.waitMs = CALL_WAIT_MS;
+  const t0 = $('#callWaitTimer');
+  if (t0) { t0.textContent = fmtWait(15 * 60); t0.style.display = ''; }
+  call.waitTimer = setInterval(() => {
+    if (!call || call.closed) { clearInterval(call.waitTimer); call.waitTimer = null; return; }
+    if (call.peers.size >= 1) { clearInterval(call.waitTimer); call.waitTimer = null; return; }
+    call.waitMs -= 1000;
+    const t = $('#callWaitTimer');
+    if (t) t.textContent = fmtWait(Math.max(0, Math.ceil(call.waitMs / 1000)));
+    if (call.waitMs <= 0) {
+      clearInterval(call.waitTimer); call.waitTimer = null;
+      leaveCall('Никто не присоединился за 15 минут — звонок завершён');
+    }
+  }, 1000);
+}
+
+function setCallStatus(text) {
+  const s = $('#callStatus');
+  if (s) s.textContent = text;
+}
+
+function renderCallPeers() {
+  if (!call) return;
+  const videos = $('#callVideos');
+  if (!videos) return;
+  const meLower = String(state.me).toLowerCase();
+  videos.replaceChildren(callVideoBox(meLower, true));
+  for (const [sid, nick] of call.peers) {
+    const nickL = String(nick).toLowerCase();
+    const box = callVideoBox(nickL === meLower ? nick + ' · устройство' : nick, false);
+    box.dataset.peer = sid;
+    videos.append(box);
+    const v = box.querySelector('video');
+    if (v) {
+      v.muted = false;
+      v.autoplay = true;
+      v.playsInline = true;
+    }
+  }
+  if (call.peers.size >= 1) {
+    setCallStatus('Звонок идёт · ' + (call.peers.size + 1) + ' участн.');
+    const t = $('#callWaitTimer');
+    if (t) t.style.display = 'none';
+  } else {
+    setCallStatus('Ожидание собеседника…');
+    const t = $('#callWaitTimer');
+    if (t) t.style.display = '';
+  }
+}
+
+function updateVoicePeers(peers) {
+  if (!call) return;
+  call.peers = new Map();
+  for (const p of peers || []) {
+    if (p.sid && p.sid !== call.mySid) call.peers.set(p.sid, String(p.nick || '?'));
+  }
+  renderCallPeers();
+  if (call.peers.size >= 1) {
+    for (const [sid, nick] of call.peers) ensurePeer(sid, nick).catch(() => {});
+  } else {
+    closeAllPeers();
+    // снова ждём собеседника: таймер ожидания перезапускается
+    if (!call.waitTimer) startWaitTimer();
+  }
+}
+
+async function ensurePeer(sid, nick) {
+  if (!call || call.closed) return;
+  if (!sid || call.pcMap.has(sid)) return;
+  const pc = new RTCPeerConnection({ iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' }
+  ] });
+  call.pcMap.set(sid, pc);
+  pc.onicecandidate = e => {
+    if (e.candidate && !call.closed) {
+      wsMessage({ type: 'voice-signal', to: sid, signal: { kind: 'ice', candidate: e.candidate } });
+    }
+  };
+  pc.ontrack = e => {
+    const box = attachRemoteStream(sid, e.streams[0] || new MediaStream([e.track]));
+    if (box) box.dataset.peer = sid;
+  };
+  if (call.localStream) {
+    for (const t of call.localStream.getTracks()) pc.addTrack(t, call.localStream);
+  }
+  if (call.screenStream) {
+    for (const t of call.screenStream.getTracks()) pc.addTrack(t, call.screenStream);
+  } else if (call.camStream) {
+    for (const t of call.camStream.getTracks()) pc.addTrack(t, call.camStream);
+  }
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  if (!call.closed) {
+    if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] sig offer ->', sid);
+    wsMessage({ type: 'voice-signal', to: sid, signal: { kind: 'offer', sdp: pc.localDescription } });
+  }
+}
+
+function attachRemoteStream(sid, stream) {
+  const videos = $('#callVideos');
+  if (!videos) return null;
+  let box = videos.querySelector(`[data-peer="${sid}"]`);
+  if (!box) {
+    const nick = call && call.peers.get(sid);
+    box = callVideoBox(nick || '…', false);
+    box.dataset.peer = sid;
+    videos.append(box);
+  }
+  const v = box.querySelector('video');
+  if (v && !v.srcObject) { v.srcObject = stream; v.muted = false; v.autoplay = true; v.playsInline = true; }
+  return box;
+}
+
+async function handleVoiceSignal(fromSid, signal) {
+  if (!call || call.closed) return;
+  if (!fromSid || fromSid === call.mySid) return;
+  if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] sig recv', signal && signal.kind, 'from', fromSid);
+  if (signal.kind === 'offer') {
+    if (!call.pcMap.has(fromSid)) {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      call.pcMap.set(fromSid, pc);
+      pc.onicecandidate = e => { if (e.candidate && !call.closed) wsMessage({ type: 'voice-signal', to: fromSid, signal: { kind: 'ice', candidate: e.candidate } }); };
+      pc.ontrack = e => attachRemoteStream(fromSid, e.streams[0] || new MediaStream([e.track]));
+      if (call.localStream) for (const t of call.localStream.getTracks()) pc.addTrack(t, call.localStream);
+      if (call.screenStream) for (const t of call.screenStream.getTracks()) pc.addTrack(t, call.screenStream);
+      else if (call.camStream) for (const t of call.camStream.getTracks()) pc.addTrack(t, call.camStream);
+    }
+    const pc = call.pcMap.get(fromSid);
+    try {
+      await pc.setRemoteDescription(signal.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      wsMessage({ type: 'voice-signal', to: fromSid, signal: { kind: 'answer', sdp: pc.localDescription } });
+    } catch (e) { /* ignore */ }
+  } else if (signal.kind === 'answer') {
+    const pc = call.pcMap.get(fromSid);
+    if (pc) { try { await pc.setRemoteDescription(signal.sdp); } catch (e) {} }
+  } else if (signal.kind === 'ice') {
+    const pc = call.pcMap.get(fromSid);
+    if (pc && signal.candidate) { try { await pc.addIceCandidate(signal.candidate); } catch (e) {} }
+  }
+}
+
+function closeAllPeers() {
+  if (!call) return;
+  for (const pc of call.pcMap.values()) { try { pc.close(); } catch (e) {} }
+  call.pcMap.clear();
+}
+
+function stopStream(s) { if (s) s.getTracks().forEach(t => t.stop()); }
+
+function toggleMic() {
+  if (!call) return;
+  call.micOn = !call.micOn;
+  if (call.localStream) call.localStream.getAudioTracks().forEach(t => t.enabled = call.micOn);
+  const b = $('#callMic');
+  if (b) b.classList.toggle('on', call.micOn);
+}
+
+async function toggleCam() {
+  if (!call) return;
+  call.camOn = !call.camOn;
+  const b = $('#callCam');
+  const meL = String(state.me).toLowerCase();
+  if (call.camOn) {
+    try {
+      if (!call.camStream) call.camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      call.camStream.getVideoTracks().forEach(t => t.enabled = true);
+      for (const pc of call.pcMap.values()) {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(call.camStream.getVideoTracks()[0]).catch(() => {});
+        else call.camStream.getVideoTracks().forEach(t => pc.addTrack(t, call.camStream));
+      }
+      const v = document.querySelector('#callVideos .call-video.local video');
+      if (v) v.srcObject = call.camStream;
+    } catch (e) { toast('Не удалось включить камеру', 'err'); call.camOn = false; }
+  } else {
+    if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = false);
+    const v = document.querySelector('#callVideos .call-video.local video');
+    if (v && v.srcObject === call.camStream) v.removeAttribute('srcObject');
+  }
+  if (b) b.classList.toggle('on', call.camOn);
+}
+
+function stopScreenShareTracks() {
+  if (call.screenStream) { stopStream(call.screenStream); call.screenStream = null; }
+}
+
+async function toggleScreen() {
+  if (!call) return;
+  const b = $('#callScreen');
+  if (call.screenOn) {
+    // выключить демонстрацию: вернуть видео камеры (или ничего)
+    call.screenOn = false;
+    if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = true);
+    for (const pc of call.pcMap.values()) {
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender && call.camStream) await sender.replaceTrack(call.camStream.getVideoTracks()[0]).catch(() => {});
+      else if (sender) await sender.replaceTrack(null).catch(() => {});
+    }
+    stopScreenShareTracks();
+  } else {
+    try {
+      call.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      call.screenOn = true;
+      if (call.camStream) call.camStream.getVideoTracks().forEach(t => t.enabled = false);
+      for (const pc of call.pcMap.values()) {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(call.screenStream.getVideoTracks()[0]).catch(() => {});
+        else call.screenStream.getVideoTracks().forEach(t => pc.addTrack(t, call.screenStream));
+      }
+      const v = document.querySelector('#callVideos .call-video.local video');
+      if (v) v.srcObject = call.screenStream;
+      call.screenStream.getVideoTracks()[0].addEventListener('ended', () => { if (call.screenOn) toggleScreen(); });
+    } catch (e) { call.screenOn = false; }
+  }
+  if (b) b.classList.toggle('on', call.screenOn);
+}
+
+function closeCall(notify) {
+  if (!call) return;
+  call.closed = true;
+  if (call.waitTimer) { clearInterval(call.waitTimer); call.waitTimer = null; }
+  closeAllPeers();
+  stopStream(call.localStream); stopStream(call.camStream); stopScreenShareTracks();
+  call = null;
+  const input = $('#chatInput');
+  if (input) input.style.display = '';
+  if (notify) {
+    const body = $('#chatBody');
+    if (body) body.replaceChildren(h('div', { class: 'empty-note' }, notify));
+  }
+}
+
+function leaveCall(msg) {
+  if (call) wsMessage({ type: 'voice', action: 'leave', guildId: call.guildId, channelId: call.channelId });
+  closeCall(msg || 'Ты вышел из звонка');
+  if (call && call.guild) renderGuildSide();
+}
+
+async function renderGuildMsgs(msgs, aad, append) {
+  const body = $('#chatBody');
+  if (!body) return;
+  // общий ключ для каждого собеседника в сервере (E2E: на каждого участника свой конверт)
+  const meLower = String(state.me).toLowerCase();
+  const g = state.gview ? guildById(state.gview.guildId) : null;
+  const sharedCache = {};
+  // свой конверт тоже читаем (self-envelope: автор видит свои сообщения)
+  sharedCache[meLower] = window.SecCrypto.sharedSecret(state.kp.secretKey, window.SecCrypto.publicB64(state.kp));
+  if (g) {
+    for (const member of g.members) {
+      const nickLower = String(member.nick).toLowerCase();
+      if (nickLower !== meLower && member.pub) {
+        sharedCache[nickLower] = window.SecCrypto.sharedSecret(state.kp.secretKey, member.pub);
+      }
+    }
+  }
+  const nodes = [];
+  let lastDay = '';
+  if (append) {
+    const lastSep = body.querySelectorAll('.day-sep');
+    lastDay = lastSep.length ? lastSep[lastSep.length - 1].textContent.trim().toLowerCase() : '';
+  }
+  let okCnt = 0;
+  for (const m of msgs) {
+    if (append && body.querySelector(`[data-id="${m.id}"]`)) continue;
+    const shared = sharedCache[String(m.from).toLowerCase()];
+    if (!shared) continue;
+    const pt = await window.SecCrypto.openMessage(shared, m.body, aad);
+    if (pt == null) continue;
+    okCnt++;
+    const day = new Date(m.ts).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+    const key = day.charAt(0).toUpperCase() + day.slice(1);
+    if (key.toLowerCase() !== lastDay) { lastDay = key.toLowerCase(); nodes.push(h('div', { class: 'day-sep' }, key)); }
+    const row = msgEl(m, pt);
+    row.setAttribute('data-from', String(m.from).toLowerCase());
+    nodes.push(row);
+    if (m.ts > state.lastTs) state.lastTs = m.ts;
+  }
+  if (append) {
+    const rows = body.querySelectorAll('.msg-row');
+    const lastRow = rows[rows.length - 1];
+    if (lastRow && nodes.length) {
+      const gap = h('div', { class: 'msg-row', style: 'display:none' });
+      body.append(gap);
+      for (const n of nodes) body.append(n);
+      markGrouped(Array.prototype.slice.call(body.querySelectorAll('.msg-row')));
+      gap.remove();
+    }
+  } else {
+    if (!nodes.length) nodes.push(h('div', { class: 'empty-note' }, okCnt === 0 && msgs.length ? 'Не удалось расшифровать — проверь свой ключ 🔑' : 'Канал пуст. Напиши первым ✨'));
+    markGrouped(nodes);
+    body.replaceChildren(...nodes);
+  }
+  scrollChat(append ? true : true);
+}
+
+async function refreshGuildChat() {
+  if (!state.gview) return;
+  const g = guildById(state.gview.guildId);
+  if (!g) return;
+  const ch = g.channels.find(c => c.id === state.gview.channelId);
+  if (!ch || ch.kind === 'voice') return;
+  try {
+    const r = await api('GET', '/api/guild/conv/' + encodeURIComponent(g.id) + '/' + encodeURIComponent(ch.id) + '?after=' + state.lastTs);
+    if (r.msgs.length) renderGuildMsgs(r.msgs, gAad(g.id, ch.id), true);
+  } catch (e) {}
+}
+
+async function sendGuildMessage() {
+  const input = $('#msgInput');
+  const text = input ? input.value.trim() : '';
+  if (!text) { console.info('SGM no-text'); return; }
+  state.gLastError = null;
+  console.info('SGM start', !!state.gview, text.length);
+  const g = guildById(state.gview.guildId);
+  const ch = g.channels.find(c => c.id === state.gview.channelId);
+  const aad = gAad(g.id, ch.id);
+  const env = {};
+  const meLower = String(state.me).toLowerCase();
+  for (const m of g.members) {
+    const nickLower = String(m.nick).toLowerCase();
+    if (nickLower === meLower || !m.pub) continue;
+    const shared = window.SecCrypto.sharedSecret(state.kp.secretKey, m.pub);
+    env[nickLower] = await window.SecCrypto.sealMessage(shared, text, aad);
+  }
+  // свой конверт тоже кладём — чтобы автор видел своё сообщение в истории
+  env[meLower] = await window.SecCrypto.sealMessage(
+    window.SecCrypto.sharedSecret(state.kp.secretKey, window.SecCrypto.publicB64(state.kp)), text, aad);
+  if (!Object.keys(env).length) { toast('В сервере пока нет собеседников с ключами', 'err'); return; }
+  try {
+    await api('POST', '/api/guild/msg', { guildId: g.id, channelId: ch.id, body: env });
+    console.info('SGM sent', g.id, ch.id, Object.keys(env).length);
+    if (input) { input.value = ''; input.style.height = 'auto'; syncComposer(input); }
+    await refreshGuildChat();
+  } catch (e) {
+    state.gLastError = (e && e.message) || String(e);
+    toast(state.gLastError, 'err');
+  }
+}
+
 // Единая точка обновления заявок: WS-push, поллинг и ручные действия ходят сюда.
 // announce=true — показать тост о НОВЫХ входящих (первый заход не считается новым).
 async function refreshRequests(announce) {
@@ -548,13 +1381,27 @@ async function refreshRequests(announce) {
 async function refreshFriends() {
   const r = await api('GET', '/api/friends');
   let changed = false;
+  let pubChangedForConv = false;
   for (const f of r.friends) {
     const g = state.friends.find(x => String(x.nick).toLowerCase() === String(f.nick).toLowerCase());
     if (!g) { changed = true; continue; }
     if (g.online !== f.online) { g.online = f.online; changed = true; }
+    if (g.pub !== f.pub) {
+      g.pub = f.pub;
+      changed = true;
+      // у собеседника сменился ключ — пересчитаем общий секрет и перезагрузим диалог
+      if (state.conv && String(f.nick).toLowerCase() === String(state.conv).toLowerCase()) pubChangedForConv = true;
+    }
   }
   if (nicksSig(r.friends) !== nicksSig(state.friends)) changed = true;
-  if (changed) { await loadFriends(); updateChatHeader(); }
+  if (changed) {
+    await loadFriends();
+    if (pubChangedForConv) {
+      try { await openChat(state.conv); } catch (e) { /* чат уже перезагружен */ }
+    } else {
+      updateChatHeader();
+    }
+  }
   return r;
 }
 
@@ -613,20 +1460,25 @@ function renderRequests() {
 
 function logout() {
   stopPoll();
+  closeCall(false);
   closeDrawer();
   closeRightPanel();
   state.ws?.close();
   localStorage.removeItem(LS.nick);
   localStorage.removeItem(LS.token);
   state.token = null; state.me = null; state.conv = null;
+  state.kp = null; state.pass = null; // ключ остаётся в localStorage под своим ником, пароль — не хранится нигде
   state.incoming = []; state.outgoing = []; state.reqLoaded = false;
+  state.guilds = []; state.gview = null; state.view = 'dm';
   renderAuth();
 }
 
 // ---------- чат ----------
 async function openChat(nick) {
   try {
+  closeCall(false);
   state.conv = nick;
+  state.gview = null;
   state.msgs = [];
   state.lastTs = 0;
   const f = state.friends.find(x => x.nick === nick);
@@ -915,7 +1767,9 @@ function scrollChat(force) {
 async function sendMessage() {
   const input = $('#msgInput');
   const text = input.value.trim();
-  if (!text || !state.conv) return;
+  if (!text) return;
+  if (state.gview) { await sendGuildMessage(); return; }
+  if (!state.conv) return;
   if (!state.shared) { toast('Нет ключа для собеседника', 'err'); return; }
   try {
     const aad = convKey(state.me, state.conv);
@@ -931,6 +1785,7 @@ async function sendMessage() {
 }
 
 async function sendFile(file) {
+  if (state.gview) { toast('Файлы в каналах пока недоступны — скоро 🙃', 'err'); $('#fileInput').value = ''; return; }
   if (!state.conv) return;
   if (!state.shared) { toast('Нет ключа для собеседника', 'err'); return; }
   if (file.size > 15 * 1024 * 1024) { toast('Файл больше 15 МБ — выбери поменьше', 'err'); $('#fileInput').value = ''; return; }
@@ -949,6 +1804,7 @@ async function sendFile(file) {
 
 // Общий путь отправки медиа: шифрование → /api/media → шифрование метаданных → /api/msg
 async function sendEncodedMedia(buf, name, mime, size, meta) {
+  if (state.gview) { toast('Файлы в каналах пока недоступны — скоро 🙃', 'err'); return; }
   const aad = convKey(state.me, state.conv);
   const env = await window.SecCrypto.sealBytes(state.shared, buf, aad);
   const up = await api('POST', '/api/media', { to: state.conv, name, mime, size, b64: env });
@@ -1038,11 +1894,12 @@ async function beginRec(mode) {
   const seq = ++recSeq;
   recPending = { mode };
 
+  const audioC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia(wantVideo
-      ? { video: { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 640 } }, audio: true }
-      : { audio: true });
+      ? { video: { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 640 } }, audio: audioC }
+      : { audio: audioC });
   } catch (e) {
     if (seq === recSeq) recPending = null;
     toast(wantVideo ? 'Не удалось включить камеру или микрофон' : 'Не удалось включить микрофон', 'err');
@@ -1060,6 +1917,7 @@ async function beginRec(mode) {
   const timer = h('div', { class: wantVideo ? 'rec-timer-badge' : 'rec-timer-inline' }, '0:00');
   if (wantVideo) {
     const live = h('video', { class: 'circ-live', autoplay: '', muted: '', playsinline: '' });
+    live.muted = true; // никогда не воспроизводим свой микрофон локально
     live.srcObject = stream;
     live.play().catch(() => {});
     bubble.append(live, timer);
@@ -1213,6 +2071,24 @@ function connectWS() {
     } else if (m.type === 'friend-declined') {
       toast(m.by + ' отклонил(а) заявку');
       refreshRequests(false).catch(() => {});
+    } else if (m.type === 'guild-msg') {
+      if (state.gview && state.gview.guildId === m.guildId && state.gview.channelId === m.channelId) {
+        refreshGuildChat().catch(() => {});
+      } else {
+        const g = guildById(m.guildId);
+        if (g) {
+          g.unread = (g.unread || 0) + 1;
+          updateGuildBadges();
+        }
+      }
+    } else if (m.type === 'voice-state') {
+      if (new URLSearchParams(location.search).get('dbg') === '1') console.info('[voice] evt', m.state, m.sid, JSON.stringify(m.peers || []));
+      if (call && call.guildId === m.guildId && call.channelId === m.channelId) {
+        if (m.state === 'joined' && m.sid) call.mySid = m.sid;
+        updateVoicePeers(m.peers || []);
+      }
+    } else if (m.type === 'voice-signal') {
+      handleVoiceSignal(m.from, m.signal).catch(() => {});
     }
   };
 
@@ -1256,6 +2132,13 @@ async function pollTick() {
     // раньше в этом случае заявка появлялась только после перезагрузки страницы.
     await refreshFriends();
     await refreshRequests(true);
+    // серверы: держим список свежим, канал — живым
+    if (state.view === 'guild') {
+      try { await loadGuilds(); } catch (e) {}
+    } else if (state.gview) {
+      state.gview = null;
+    }
+    if (state.gview) await refreshGuildChat();
   } catch (e) { /* тихо: следующая итерация */ }
 }
 
@@ -1326,11 +2209,17 @@ async function demoInit(user) {
     catch (e) { try { await api('POST', '/api/register', { nick: u, pass: 'demo' }); } catch (e2) { /* уже есть */ } }
   }
   const r = await api('POST', '/api/login', { nick: user, pass: 'demo' });
-  state.me = r.nick; state.token = r.token;
+  state.me = r.nick; state.token = r.token; state.pass = 'demo';
   localStorage.setItem(LS.nick, state.me);
   localStorage.setItem(LS.token, state.token);
-  state.kp = loadKp() || makeKp();
-  await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) });
+  const dres = await resolveKeyForAccount('demo');
+  if (dres.kp) {
+    state.kp = dres.kp;
+  } else {
+    state.kp = makeKp();
+    await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) });
+  }
+  vaultSave('demo', state.kp);
 
   const other = user === 'demo_alice' ? 'demo_bob' : 'demo_alice';
 
@@ -1343,6 +2232,11 @@ async function demoInit(user) {
         ? window.SecCrypto.keypairFromSecret(localStorage.getItem('sk_kp_demo_bob'))
         : (() => { const k = window.SecCrypto.generateKeypair(); localStorage.setItem('sk_kp_demo_bob', window.SecCrypto.exportSecret(k)); return k; })();
       await apiToken(tok2, 'PUT', '/api/me', { pub: window.SecCrypto.publicB64(kp2) });
+      // демо: ключ второго участника тоже кладём в аккаунт — иначе его «устройство» не увидит историю
+      try {
+        const vb = await window.SecCrypto.wrapSecret(window.SecCrypto.exportSecret(kp2), 'demo');
+        await apiToken(tok2, 'POST', '/api/vault', { vault: vb });
+      } catch (e) { /* не критично */ }
       const reqs = await apiToken(tok2, 'GET', '/api/friend/requests');
       if (reqs.incoming.length) await apiToken(tok2, 'POST', '/api/friend/accept', { nick: reqs.incoming[0].nick });
       friends = (await api('GET', '/api/friends')).friends;
@@ -1362,6 +2256,11 @@ async function demoInit(user) {
         ? window.SecCrypto.keypairFromSecret(localStorage.getItem('sk_kp_demo_bob'))
         : (() => { const k = window.SecCrypto.generateKeypair(); localStorage.setItem('sk_kp_demo_bob', window.SecCrypto.exportSecret(k)); return k; })();
       await apiToken(tok2, 'PUT', '/api/me', { pub: window.SecCrypto.publicB64(kp2) });
+      // демо: ключ второго участника тоже кладём в аккаунт — иначе его «устройство» не увидит историю
+      try {
+        const vb = await window.SecCrypto.wrapSecret(window.SecCrypto.exportSecret(kp2), 'demo');
+        await apiToken(tok2, 'POST', '/api/vault', { vault: vb });
+      } catch (e) { /* не критично */ }
       const f2 = (await apiToken(tok2, 'GET', '/api/friends')).friends.find(x => x.nick.toLowerCase() === 'demo_alice');
       const shared2 = window.SecCrypto.sharedSecret(kp2.secretKey, f2.pub);
       const body2 = await window.SecCrypto.sealMessage(shared2, 'Ага, вижу 😏 И никто не подслушает.', aad);
@@ -1411,7 +2310,12 @@ async function boot() {
   if (q.get('pop') === 'theme') setTimeout(() => showThemeModal(), 900);
   if (q.get('drawer') === '1') setTimeout(() => openDrawer(), 900);
 
-  // тестовый вход: ?t=ник|пароль&fresh=1 (для автотестов интерфейса)
+  // тестовый вход: ?t=ник|пароль (для автотестов интерфейса)
+  //   &fresh=1   — «первое устройство»: сбросить локальный ключ, создать новый и залить конверт
+  //   &nokey=1   — «второе устройство»: локального ключа нет, ключ должен приехать из аккаунта
+  //   &novault=1 — удалить конверт из аккаунта (сценарий «отмычки нигде нет»)
+  //   &plant=1   — подложить чужой локальный ключ (сценарий «ключ не от этого аккаунта»)
+  //   &keysave=1 — «старый аккаунт»: ключ только на устройстве, конверта нет (сценарий «сохрани ключ»)
   const t = q.get('t');
   if (t) {
     const [nn, pp] = t.split('|');
@@ -1422,26 +2326,58 @@ async function boot() {
       catch (e2) { if (e2.status !== 409) { renderAuth(); return; } }
     }
     const r = await api('POST', '/api/login', { nick: nn, pass: pp });
-    state.me = r.nick; state.token = r.token;
+    state.me = r.nick; state.token = r.token; state.pass = pp;
     localStorage.setItem(LS.nick, state.me);
     localStorage.setItem(LS.token, state.token);
-    if (q.get('fresh') === '1') { localStorage.removeItem(LS.kp); state.kp = makeKp(); }
-    else state.kp = loadKp() || makeKp();
-    try { await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) }); }
-    catch (e) { /* ignore */ }
-    if (q.get('fresh') === '1') showKeyModal('new');
-    else {
-      await initMain();
-      if (q.get('conv')) {
-        try { await openChat(q.get('conv')); }
-        catch (e) { /* уже показано в чате */ }
-        if (q.get('top') === '1') {
-          const tb = $('#chatBody');
-          if (tb) { tb.scrollTop = 0; updateJump(); }
-        }
-        applyForceJump();
-        await devAutosend(q.get('autosend'));
+    state.kp = loadKp(state.me);
+    if (q.get('fresh') === '1' || q.get('nokey') === '1') { dropKp(state.me); state.kp = null; }
+    if (q.get('novault') === '1') { try { await api('DELETE', '/api/vault'); } catch (e) { /* ignore */ } }
+    if (q.get('plant') === '1') { state.kp = makeKp(); saveKp(state.kp, state.me); }
+    if (q.get('keysave') === '1') {
+      // «старый аккаунт»: ключ есть только на этом устройстве, конверта в аккаунте нет,
+      // пароля в памяти тоже нет — должен появиться запрос «Сохранить ключ в аккаунт»
+      state.kp = makeKp(state.me);
+      try { await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) }); } catch (e) { /* ignore */ }
+      try { await api('DELETE', '/api/vault'); } catch (e) { /* ignore */ }
+      state.pass = null;
+    }
+    if (q.get('fresh') === '1') {
+      state.kp = makeKp();
+      await vaultSave(pp);
+      try { await api('PUT', '/api/me', { pub: window.SecCrypto.publicB64(state.kp) }); }
+      catch (e) { /* ignore */ }
+      showKeyModal('new');
+      return;
+    }
+    {
+      // всегда сверяем ключ с аккаунтом: локальный может быть от другого устройства/ключа
+      const res = await resolveKeyForAccount(pp);
+      if (res.kp) { state.kp = res.kp; if (res.from === 'vault') vaultSave(pp); }
+      else { showKeyModal('enter', { reason: res.from, pass: pp }); return; }
+    }
+    await initMain();
+    if (q.get('view') === 'guild') setView('guild');
+    if (q.get('send') === '1' && q.get('view') === 'guild') {
+      setTimeout(async () => {
+        for (let i = 0; i < 30 && !state.gview; i++) await new Promise(r => setTimeout(r, 300));
+        const inp = $('#msgInput');
+        if (!inp) return;
+        inp.value = 'Отправка из UI 🚀';
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise(r => setTimeout(r, 300));
+        const sb = $('#sendBtn');
+        if (sb) sb.click();
+      }, 1500);
+    }
+    if (q.get('conv')) {
+      try { await openChat(q.get('conv')); }
+      catch (e) { /* уже показано в чате */ }
+      if (q.get('top') === '1') {
+        const tb = $('#chatBody');
+        if (tb) { tb.scrollTop = 0; updateJump(); }
       }
+      applyForceJump();
+      await devAutosend(q.get('autosend'));
     }
     return;
   }
@@ -1450,6 +2386,7 @@ async function boot() {
     try { await demoInit(demo); } catch (e) { console.error('demo', e); }
     await initMain();
     applyForceJump();
+    if (q.get('view') === 'guild') setView('guild');
     if (q.get('conv')) { try { await openChat(q.get('conv')); } catch (e) {} }
     if (q.get('autosend')) await devAutosend(q.get('autosend'));
     return;
@@ -1460,7 +2397,7 @@ async function boot() {
     state.kp = loadKp();
     try {
       await api('GET', '/api/friends'); // проверка токена
-      if (!state.kp) showKeyModal('enter');
+      if (!state.kp) { toast('Войди заново — ключ подтянется из аккаунта 🔑'); logout(); }
       else { await initMain(); applyForceJump(); }
     } catch (e) {
       if (e.status === 401) { logout(); } else { renderAuth(); toast(e.message, 'err'); }

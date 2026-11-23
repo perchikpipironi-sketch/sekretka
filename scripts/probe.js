@@ -109,7 +109,7 @@ async function targets() {
     : '({title: document.title, url: location.href})';
   // проба, начинающаяся с /*async*/, может использовать await (например, ждать запись)
   const isAsync = /^\s*\/\*async\*\//.test(exprRaw);
-  const expr = exprRaw.replace(/^\s*\/\*async\*\//, '');
+  const expr = exprRaw.replace(/^\s*\/\*async\*\//, '').replace(/^\s*[\r\n]+/, '');
   const body = isAsync
     ? `(async function(){ try { return JSON.stringify(await (async function(){ ${expr} })()); } catch(e){ return JSON.stringify({error: String(e && e.stack || e)}); } })()`
     : `(function(){ try { return JSON.stringify((function(){ ${expr} })()); } catch(e){ return JSON.stringify({error: String(e && e.stack || e)}); } })()`;
@@ -129,7 +129,7 @@ async function targets() {
     shotPath = path.resolve(shot);
   }
 
-  console.log(JSON.stringify({ url, size: [W, H], result: out, screenshot: shotPath, consoleEntries: print.length }, null, 2));
+  console.log(JSON.stringify({ url, size: [W, H], result: out, screenshot: shotPath, consoleEntries: print.length, consoleLog: print.map(p => (p.args || []).map(a => a.value !== undefined ? a.value : (a.description || '')).join(' ')) }, null, 2));
 
   ws.close();
   try { child.kill(); } catch (e) {}
